@@ -1,0 +1,92 @@
+import streamlit as st
+
+import db
+import logic
+
+BD_KEY = "bd_state_v1"
+PK_KEY = "pk_state_v1"
+SCHEDULE_KEY = "schedule_v1"
+
+
+def load_bd():
+    bd = db.get_state(BD_KEY)
+    if not bd or not bd.get("ties"):
+        bd = logic.bd_init()
+        db.set_state(BD_KEY, bd, actor="system", action="init")
+    return bd
+
+
+def save_bd(bd, actor="admin", action="update"):
+    db.set_state(BD_KEY, bd, actor=actor, action=action)
+
+
+def load_pk():
+    pk = db.get_state(PK_KEY)
+    if not pk or not pk.get("groups"):
+        pk = logic.pk_init_default()
+        db.set_state(PK_KEY, pk, actor="system", action="init")
+    elif logic.pk_needs_bo5_migration(pk):
+        # Semi-Final/Final used to be best-of-3 like every other round;
+        # a bracket saved before that changed still has 3-game K3/GF
+        # ties, so pad them up to 5 (keeping existing scores) every time
+        # one is loaded, same auto-heal pattern as load_bd's routing fix.
+        pk = logic.pk_migrate_bo5(pk)
+        db.set_state(PK_KEY, pk, actor="system", action="migrate_bo5")
+    return pk
+
+
+def save_pk(pk, actor="admin", action="update"):
+    db.set_state(PK_KEY, pk, actor=actor, action=action)
+
+
+def load_schedule():
+    return db.get_state(SCHEDULE_KEY, {"bd": {}, "pk": {}, "bd_rounds": None, "pk_rounds": None})
+
+
+def save_schedule(sched, actor="admin"):
+    db.set_state(SCHEDULE_KEY, sched, actor=actor, action="schedule_update")
+
+
+def reset_bd(actor="admin"):
+    bd = logic.bd_init()
+    save_bd(bd, actor=actor, action="reset_all")
+    return bd
+
+
+def reset_bd_scores(actor="admin"):
+    """Clears every score, category result, and cascaded team assignment
+    back to blank, but keeps the Round 1 team pairings you entered —
+    mirrors reset_pk_scores below, just for the badminton bracket, which
+    doesn't have a separate group/knockout split to reset independently."""
+    bd = load_bd()
+    new_bd = logic.bd_reset_scores(bd)
+    save_bd(new_bd, actor=actor, action="reset_scores")
+    return new_bd
+
+
+def reset_pk(actor="admin"):
+    pk = logic.pk_init_default()
+    save_pk(pk, actor=actor, action="reset_all")
+    return pk
+
+
+def reset_pk_scores(actor="admin"):
+    """Clears every group-stage match's games/scores back to 0-0, but
+    leaves the pairs/groups setup (and the knockout bracket) untouched —
+    for wiping test scores without having to re-enter who's in which group."""
+    pk = load_pk()
+    pk["matches"] = {}
+    save_pk(pk, actor=actor, action="reset_scores")
+    return pk
+
+
+def reset_pk_knockout(actor="admin"):
+    """Resets the knockout bracket back to its blank template (no pairs
+    assigned, no scores) — leaves the group stage (pairs and their match
+    scores) untouched. Meant for clearing out a bracket before it gets
+    auto-seeded for real, in case it was seeded early with placeholder
+    or incomplete group results."""
+    pk = load_pk()
+    pk["ko"] = logic.pk_init_ko()
+    save_pk(pk, actor=actor, action="reset_knockout")
+    return pk

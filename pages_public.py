@@ -1,0 +1,1438 @@
+import html as _html
+import time
+
+import streamlit as st
+import streamlit.components.v1 as components
+
+import bracket_svg
+import logic
+import state
+import ui
+
+
+def _balanced_grid_cols(n):
+    """Column count for a grid of n live-match tiles, chosen so the last
+    row isn't left with a single lonely tile stranded by itself — auto-fit
+    packs greedily left-to-right (as many tiles as fit per row), which for
+    something like 7 tiles at a decent tile width gave "6 tiles, then 1"
+    instead of a more even "4, then 3". Starts from a roughly square
+    layout (rows ~= sqrt(n)) and backs off a row at a time whenever that
+    would leave exactly one tile dangling on its own last row."""
+    if n <= 1:
+        return 1
+    rows = max(1, round(n ** 0.5))
+    cols = -(-n // rows)  # ceil division
+    while rows > 1 and n % cols == 1:
+        rows -= 1
+        cols = -(-n // rows)
+    return cols
+
+
+def _truncate_name(name, maxlen=22):
+    """Hard-cap a team/pair name's rendered length with an ellipsis.
+
+    The monitor tiles size themselves responsively (CSS grid, flex), which
+    is necessary for the layout to adapt from a single full-width spotlight
+    card down to a 4-5-per-row mobile grid. But a raw HTML <table> with
+    `white-space:nowrap` name cells (needed so scores don't wrap awkwardly)
+    will happily force the whole table WIDER than its card to fit a long
+    department name in full, and CSS-only ellipsis truncation on table
+    cells needs `table-layout:fixed` with hand-tuned column widths — fragile
+    to get right across every card size these tiles render at. Truncating
+    the string itself in Python is a hard guarantee: the table can never be
+    forced wider than intended by name length, at any screen size, without
+    depending on any particular CSS layout mode holding up.
+
+    maxlen=None disables truncation entirely — used on the projector/kiosk
+    page (live_only), which has room to let a long name wrap onto a second
+    line instead (see the full_name plumbing in the tile/table builders
+    below) rather than ever showing a name with a chunk sheared off.
+    Escaped via html.escape since these strings go straight into raw HTML."""
+    name = name or ""
+    if maxlen is not None and len(name) > maxlen:
+        name = name[: maxlen - 1].rstrip() + "…"
+    return _html.escape(name)
+
+
+def render_overview():
+    st.markdown(
+        """
+        <div class="cc-eyebrow">Tournament Command Center · Internal Use Only</div>
+        <div class="cc-hero-title">LBS × MGB <em>Sports Tournament</em></div>
+        <div class="cc-hero-sub">Live badminton and pickleball draw, scoring, and standings for the LBS × MGB
+        interdepartmental sports day. Viewers get read-only monitors; admins get one login for everything.</div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown("<br>", unsafe_allow_html=True)
+    hc1, hc2, _ = st.columns([1.1, 1.1, 3])
+    with hc1:
+        if st.button("🏸  View Badminton", type="primary", use_container_width=True):
+            st.session_state["current_page"] = "Badminton"
+            st.rerun()
+    with hc2:
+        if st.button("🏓  View Pickleball", use_container_width=True):
+            st.session_state["current_page"] = "Pickleball"
+            st.rerun()
+
+    bd = state.load_bd()
+    pk = state.load_pk()
+    bd_champ = logic.bd_champion(bd)
+    pk_champ = logic.pk_champion(pk)
+    bd_live = len(_bd_live_ties(bd))
+    bd_done = sum(1 for t in bd["ties"].values() if t["winner"])
+    pk_done = sum(1 for t in pk["ko"].values() if t["winner"])
+
+    tags = (
+        f'<span class="cc-tag">✓ Badminton: {"🏆 " + bd_champ if bd_champ else f"{bd_live} live · {bd_done} ties done"}</span>'
+        f'<span class="cc-tag">✓ Pickleball: {"🏆 " + pk_champ if pk_champ else f"{pk_done} knockout matches done"}</span>'
+        f'<span class="cc-tag">✓ Scores save instantly — everyone sees live updates on refresh</span>'
+    )
+    st.markdown(
+        f"""
+        <div class="cc-panel">
+          <span class="cc-badge">● System Overview — Start Here</span>
+          <h2>Two live tournaments, tracked in <em>real time</em></h2>
+          <p>Every score entered by an admin saves straight to the tournament database. Viewers watching
+          the monitor or bracket view see it on their next refresh — no manual syncing, no separate export.</p>
+          {tags}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="cc-modules-label">Where to go</div>', unsafe_allow_html=True)
+    m1, m2, m3 = st.columns(3)
+    modules = [
+        (m1, "cc-card-gold", "🏸", "View 01", "Badminton", "Live monitor and bracket view for the 16-department double-elimination draw.",
+         "💡 Toggle between the connected-line bracket and the dark live monitor.", "Badminton"),
+        (m2, "cc-card-teal", "🏓", "View 02", "Pickleball", "Group-stage standings and knockout bracket for all 22 pairs across 4 groups.",
+         "💡 Top 4 per group advance automatically once standings are updated.", "Pickleball"),
+        (m3, "cc-card-purple", "🔐", "View 03", "Admin Login", "Score entry and team setup — behind the shared admin password.",
+         "💡 Unlock admin mode from the sidebar to see this.", None),
+    ]
+    for col, cls, icon, step, title, desc, tip, target in modules:
+        with col:
+            st.markdown(
+                f"""
+                <div class="cc-card {cls}">
+                  <div class="cc-card-icon">{icon}</div>
+                  <div class="cc-card-step">{step}</div>
+                  <div class="cc-card-title">{title}</div>
+                  <div class="cc-card-desc">{desc}</div>
+                  <div class="cc-card-tip">{tip}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if target:
+                if st.button(f"Go to {title}", key=f"cc_go_{title}", use_container_width=True):
+                    st.session_state["current_page"] = target
+                    st.rerun()
+            else:
+                st.caption("Use the 🔒 Admin login box in the sidebar")
+
+
+def _bd_live_ties(bd):
+    live = []
+    for tid, tie in bd["ties"].items():
+        if tie["winner"]:
+            continue
+        if not tie["t1"] or not tie["t2"]:
+            continue
+        started = any(g["finished"] for c in tie["cats"] for g in c["games"])
+        if started:
+            live.append((tid, tie))
+    return live
+
+
+def _bd_tie_status(tie):
+    if tie["winner"] is not None:
+        return "done"
+    if not tie["t1"] or not tie["t2"]:
+        return "pending"
+    active = any(g["finished"] or g["p1"] > 0 or g["p2"] > 0 for c in tie["cats"] for g in c["games"])
+    return "live" if active else "scheduled"
+
+
+def _bd_score_table_html(tie, current_ci, compact=True, show_names=False, show_tally=False, full_name=False):
+    """Real scoreboard table: one column-group per category (colspan = number
+    of games played/live in that category), one row per team, each cell is
+    that team's own point total for that game — e.g. MD1 becomes two columns
+    (Game 1, Game 2) with HR's row reading 18, 4 and BI's row reading 21, 21,
+    instead of a single cramped '18-21 · 4-21' string.
+
+    When show_names/show_tally are set, the team name and the running tie
+    tally (category wins) become the first/last column of this *same* table
+    — so the name, every per-game score, and the tally sit in one row and
+    line up automatically via normal table layout, rather than being three
+    separately-positioned flex boxes that have to be manually kept in sync."""
+    cats_info = []
+    for ci in range(5):
+        cat = tie["cats"][ci]
+        started = any(g["finished"] or g["p1"] > 0 or g["p2"] > 0 for g in cat["games"])
+        if ci == 4 and not (tie["tbNeeded"] or started):
+            continue  # hide the tie-breaker column unless it's actually in play
+        vis = logic.bd_visible_games(cat["games"])
+        games = [cat["games"][gi] for gi in vis]
+        winner = logic.bd_cat_winner(cat)
+        cats_info.append({"ci": ci, "abbr": logic.BD_CAT_ABBR[ci], "games": games, "winner": winner})
+    if not cats_info:
+        return ""
+
+    hdr_size = "8.5px" if compact else "13px"
+    cell_size = "10.5px" if compact else "20px"
+    cell_pad = "3px 5px" if compact else "10px 16px"
+    name_size = "11px" if compact else "16px"
+
+    t1, t2 = tie["t1"] or "TBD", tie["t2"] or "TBD"
+    t1_color = "#f5c518" if tie["winner"] == 1 else ("#6b6960" if tie["winner"] == 2 else "#e8e6df")
+    t2_color = "#ea580c" if tie["winner"] == 2 else ("#6b6960" if tie["winner"] == 1 else "#e8e6df")
+
+    name_hdr = f'<th style="padding:{cell_pad}"></th>' if show_names else ""
+    hdr_cells = name_hdr
+    for c in cats_info:
+        n = max(len(c["games"]), 1)
+        if c["winner"] == 1:
+            color = "#f5c518"
+        elif c["winner"] == 2:
+            color = "#ea580c"
+        elif c["ci"] == current_ci:
+            color = "#f59e0b"
+        else:
+            color = "#8a877d"
+        hdr_cells += (
+            f'<th colspan="{n}" style="font-size:{hdr_size};font-family:\'DM Mono\',monospace;color:{color};'
+            f'font-weight:800;text-transform:uppercase;letter-spacing:.04em;padding:{cell_pad};'
+            f'border-bottom:1px solid #2a2a24;border-left:1px solid #2a2a24;text-align:center">{c["abbr"]}</th>'
+        )
+    tally_hdr = (
+        f'<th style="font-size:{hdr_size};font-family:\'DM Mono\',monospace;color:#d99a2b;font-weight:800;'
+        f'text-transform:uppercase;letter-spacing:.04em;padding:{cell_pad};border-bottom:1px solid #2a2a24;'
+        f'border-left:1px solid #2a2a24;text-align:center;white-space:nowrap">Total Wins</th>'
+    ) if show_tally else ""
+    hdr_cells += tally_hdr
+
+    def team_row(slot, name, color, weight, tally):
+        cells = ""
+        if show_names:
+            wrap = "white-space:normal;word-break:break-word;max-width:260px" if full_name else "white-space:nowrap"
+            cells += (
+                f'<td class="bd-name-cell" style="padding:{cell_pad};font-size:{name_size};font-weight:800;color:{color};'
+                f'{wrap};text-align:left">{_truncate_name(name, maxlen=None if full_name else 22)}</td>'
+            )
+        for c in cats_info:
+            if not c["games"]:
+                cells += (
+                    f'<td style="padding:{cell_pad};text-align:center;color:#4a4a44;border-left:1px solid #2a2a24;'
+                    f'font-family:\'DM Mono\',monospace;font-size:{cell_size}">–</td>'
+                )
+                continue
+            for gi, g in enumerate(c["games"]):
+                border = "border-left:1px solid #2a2a24;" if gi == 0 else ""
+                val = g["p1"] if slot == 1 else g["p2"]
+                cells += (
+                    f'<td style="padding:{cell_pad};text-align:center;color:{color};font-weight:{weight};'
+                    f'font-family:\'DM Mono\',monospace;font-size:{cell_size};{border}">{val}</td>'
+                )
+        if show_tally:
+            cells += (
+                f'<td class="bd-tally-cell" style="padding:{cell_pad};text-align:center;color:{color};font-weight:800;'
+                f'font-family:\'DM Mono\',monospace;font-size:{cell_size};border-left:1px solid #2a2a24">{tally}</td>'
+            )
+        return cells
+
+    row1 = team_row(1, t1, t1_color, "800" if tie["winner"] == 1 else "600", tie["w1"] or 0)
+    row2 = team_row(2, t2, t2_color, "800" if tie["winner"] == 2 else "600", tie["w2"] or 0)
+
+    return f"""
+    <table style="border-collapse:collapse;width:{"100%" if show_names else "auto"};margin-top:8px">
+      <thead><tr>{hdr_cells}</tr></thead>
+      <tbody>
+        <tr>{row1}</tr>
+        <tr>{row2}</tr>
+      </tbody>
+    </table>
+    """
+
+
+def _bd_mon_tile_html(tie, big=False, full_name=False):
+    status = _bd_tie_status(tie)
+    t1 = _truncate_name(tie["t1"] or "TBD", maxlen=None if full_name else 22)
+    t2 = _truncate_name(tie["t2"] or "TBD", maxlen=None if full_name else 22)
+    w1, w2 = tie["w1"] or 0, tie["w2"] or 0
+    border = "1px solid #f59e0b" if status == "live" else ("1px solid #2a2a24" if status != "done" else "1px solid #2f4f3a")
+    badge = ('<span style="background:#f59e0b;color:#111;font-size:9px;font-weight:800;padding:2px 6px;'
+             'border-radius:3px;letter-spacing:.03em">● LIVE</span>') if status == "live" else (
+             '<span style="color:#f5c518;font-size:10px;font-weight:700">✓ FINAL</span>' if status == "done" else "")
+    t1_color = "#f5c518" if (status == "done" and tie["winner"] == 1) else ("#6b6960" if (status == "done" and tie["winner"] == 2) else "#e8e6df")
+    t2_color = "#f5c518" if (status == "done" and tie["winner"] == 2) else ("#6b6960" if (status == "done" and tie["winner"] == 1) else "#e8e6df")
+    t1_weight = "700" if not (status == "done" and tie["winner"] == 2) else "400"
+    t2_weight = "700" if not (status == "done" and tie["winner"] == 1) else "400"
+    pad = "14px" if big else "10px"
+    name_size = "16px" if big else "13px"
+    score_size = "22px" if big else "17px"
+
+    activity_line = ""
+    activity_banner = ""
+    current_ci = None
+    if status == "live":
+        act = logic.bd_current_activity(tie)
+        if act:
+            current_ci = act["ci"]
+            act_size = "13px" if big else "11px"
+            pt_size = "16px" if big else "13px"
+            activity_line = f"""
+            <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a2a24;font-size:{act_size};
+                        color:#c9c6bd;font-family:'DM Mono',monospace;display:flex;justify-content:space-between;align-items:center">
+              <span>{act["cat_name"]} · Game {act["game_no"]}</span>
+              <span style="font-weight:800;font-size:{pt_size};color:#f5c518">{act["p1"]}–{act["p2"]}</span>
+            </div>
+            """
+            # Prominent "Currently Playing" banner for the spotlight tile —
+            # a dedicated block (not just a footer line) so the category in
+            # play and its live score read clearly at a glance, and scales
+            # further via the .bd-activity-* classes in jumbotron mode.
+            activity_banner = f"""
+            <div class="bd-activity" style="margin-top:14px;padding:12px 18px;border-radius:8px;
+                        background:linear-gradient(90deg,rgba(245,158,11,.14),rgba(245,158,11,.03));
+                        border:1px solid rgba(245,158,11,.35);display:flex;justify-content:space-between;
+                        align-items:center;gap:14px">
+              <div>
+                <div class="bd-activity-label" style="font-size:10px;color:#f5c518;font-weight:800;
+                            text-transform:uppercase;letter-spacing:.08em;font-family:'DM Mono',monospace">
+                  ● Currently Playing</div>
+                <div class="bd-activity-cat" style="font-size:18px;color:#fff;font-weight:800;margin-top:3px">
+                  {act["cat_name"]}
+                  <span style="color:#8a877d;font-weight:600;font-size:13px">&nbsp;·&nbsp;Game {act["game_no"]}</span>
+                </div>
+              </div>
+              <div class="bd-activity-score" style="font-family:'DM Mono',monospace;font-weight:800;
+                          font-size:32px;color:#f5c518;white-space:nowrap;flex-shrink:0">{act["p1"]}–{act["p2"]}</div>
+            </div>
+            """
+        elif tie["tbNeeded"]:
+            current_ci = 4
+            act_size = "13px" if big else "11px"
+            activity_line = f'<div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a2a24;font-size:{act_size};color:#f59e0b">Tie-Breaker decides it</div>'
+            activity_banner = (
+                '<div class="bd-activity" style="margin-top:14px;padding:12px 18px;border-radius:8px;'
+                'background:rgba(245,158,11,.10);border:1px solid rgba(245,158,11,.35);color:#f59e0b;'
+                'font-weight:800;font-size:15px;text-align:center;font-family:\'DM Mono\',monospace;'
+                'text-transform:uppercase;letter-spacing:.04em">⚡ Tie-Breaker decides it</div>'
+            )
+
+    cat_strip = _bd_score_table_html(tie, current_ci, compact=True, full_name=full_name) if status in ("live", "done") else ""
+
+    header_and_teams = f"""
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <span style="font-size:9px;color:#8a877d;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:.06em">
+          {logic.BD_ROUND_INFO[tie["id"].split("_")[0]]["label"]}</span>
+        {badge}
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:{name_size};font-weight:{t1_weight};color:{t1_color}">
+        <span class="mon-team-name" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:8px">{t1}</span>
+        <span style="font-family:'DM Mono',monospace;font-size:{score_size};font-weight:800;flex-shrink:0">{w1}</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:{name_size};font-weight:{t2_weight};color:{t2_color}">
+        <span class="mon-team-name" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:8px">{t2}</span>
+        <span style="font-family:'DM Mono',monospace;font-size:{score_size};font-weight:800;flex-shrink:0">{w2}</span>
+      </div>
+      {activity_line}
+    """
+
+    if big:
+        # Spotlight layout: one real table for the whole scoreboard — team
+        # name is the table's first column, per-game scores are the middle
+        # columns, category tally is the last column. Same rows, so names
+        # and numbers line up by construction instead of three separately
+        # positioned boxes that had to be kept in sync by hand.
+        header_row = f"""
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+            <span style="font-size:10px;color:#8a877d;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:.06em">
+              {logic.BD_ROUND_INFO[tie["id"].split("_")[0]]["label"]}</span>
+            {badge}
+          </div>
+        """
+        cat_table = _bd_score_table_html(tie, current_ci, compact=False, show_names=True, show_tally=True, full_name=full_name)
+        return f"""
+        <div style="background:#1c1c19;border:{border};border-radius:10px;padding:{pad};min-width:200px;max-width:100%;overflow-x:auto" class="mon-tile-card">
+          {header_row}
+          {cat_table}
+          {activity_banner}
+        </div>
+        """
+
+    return f"""
+    <div style="background:#1c1c19;border:{border};border-radius:10px;padding:{pad};min-width:200px;max-width:100%;overflow-x:auto" class="mon-tile-card">
+      {header_and_teams}
+      {cat_strip}
+    </div>
+    """
+
+
+def _render_bd_monitor_html(bd, rounds, live_only=False):
+    live = [t for t in bd["ties"].values() if _bd_tie_status(t) == "live" and t["id"].split("_")[0] in rounds]
+    if live:
+        # Only spotlight-treat a SINGLE live tie as a full-width "big" jumbo
+        # card (wide table, huge fonts) — that layout assumes one card gets
+        # the whole row. With several ties live at once (common once WB and
+        # LB rounds run in parallel), forcing every one of them into that
+        # same wide layout then squeezing them into a flex row was the bug:
+        # each card shrank to ~260px, far narrower than the big table needs,
+        # so team names overflowed the card's edge and most of the score
+        # columns were clipped off-screen — exactly the "names not in the
+        # box" / "only shows one game" symptoms. With 2+ simultaneous live
+        # ties, fall back to the compact tile (smaller fonts, same full
+        # per-game breakdown) sized for a multi-column grid instead.
+        # CSS grid with auto-fit/minmax also replaces the old flex+min-width
+        # row: grid computes column count from the ACTUAL rendered
+        # container width, so it can't produce the same overflow-past-the-
+        # viewport squeeze flexbox did on narrow/mobile widths.
+        if len(live) == 1:
+            spotlight_width = "900px" if live_only else "520px"
+            tiles = f'<div style="width:100%;max-width:{spotlight_width}">{_bd_mon_tile_html(live[0], big=True, full_name=live_only)}</div>'
+            live_section = f'<div style="margin-bottom:22px">{tiles}</div>'
+        else:
+            # More matches live at once means less room per tile — a fixed
+            # "big" font size that looked right for 2-3 simultaneous ties
+            # ran 6+ of them off the bottom of the screen entirely. Scale
+            # the tile size DOWN as the live count goes up so a busy
+            # multi-court session still lands on one screen without
+            # scrolling, instead of every tile always claiming the same
+            # amount of space regardless of how many need to fit.
+            n = len(live)
+            tier = "lg" if n <= 3 else ("md" if n <= 6 else "sm")
+            cols = _balanced_grid_cols(n)
+            tiles = "".join(_bd_mon_tile_html(t, full_name=live_only) for t in live)
+            live_section = (
+                f'<div class="bd-fs-multi bd-fs-multi-{tier}" style="display:grid;'
+                f'grid-template-columns:repeat({cols},1fr) !important;'
+                f'gap:12px;margin-bottom:22px">{tiles}</div>'
+            )
+    else:
+        live_section = '<div style="color:#8a877d;font-size:13px;margin-bottom:22px">No matches currently in progress.</div>'
+
+    sections = ""
+    for r in logic.ALL_BD_ROUNDS:
+        if live_only or r not in rounds:
+            continue
+        ties = [t for tid, t in bd["ties"].items() if tid.split("_")[0] == r]
+        if not ties:
+            continue
+        # CSS grid instead of a fixed 230px flex tile: badminton's compact
+        # score table can need up to 5 category columns (vs. pickleball's
+        # max 3 game columns), so a hard 230px was routinely too narrow and
+        # fell back to the horizontal-scrollbar safety net on nearly every
+        # card — which looked cluttered/inconsistent next to pickleball's
+        # tiles, which almost never needed to scroll. minmax(260px,...)
+        # gives the wider table breathing room; auto-fit still collapses to
+        # a single column on mobile, same as the "Live Now" grid above.
+        tiles = "".join(_bd_mon_tile_html(t) for t in ties)
+        sections += f"""
+        <div style="margin-bottom:20px">
+          <div style="font-size:11px;color:#8a877d;text-transform:uppercase;letter-spacing:.08em;
+                      font-family:'DM Mono',monospace;margin-bottom:10px">{logic.BD_ROUND_INFO[r]["label"]}</div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px">{tiles}</div>
+        </div>
+        """
+
+    # The fullscreen button uses the standard Fullscreen API on the #bd-live-now
+    # element. A JS listener toggles a `bd-fs` class on that element (in
+    # addition to the native :fullscreen pseudo-class) purely so the CSS below
+    # can use plain, high-specificity class selectors with !important to
+    # override the inline per-cell font-sizes set by Python — the jumbotron
+    # look needs everything bigger and centered, which inline styles alone
+    # can't be overridden by without !important.
+    overview_html = "" if live_only else f"""
+      <div style="color:#8a877d;font-size:11px;text-transform:uppercase;letter-spacing:.08em;
+                  font-family:'DM Mono',monospace;margin-bottom:12px">Tournament Overview</div>
+      {sections}
+    """
+    html = f"""
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <div style="color-scheme:dark;background:#111110;padding:20px;border-radius:12px;font-family:'Inter',sans-serif;min-height:850px">
+      <div id="bd-live-now" class="{'bd-fs' if live_only else ''}">
+        <div class="bd-fs-topbar" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:6px">
+          <div style="display:flex;align-items:center;gap:8px">
+            <span style="width:8px;height:8px;border-radius:50%;background:#f43f5e;display:inline-block"></span>
+            <span style="color:#e8e6df;font-size:12px;font-weight:800;letter-spacing:.06em;text-transform:uppercase">Live Now</span>
+            <span class="bd-fs-brand" style="display:none;color:#8a877d;font-size:12px;font-family:'DM Mono',monospace;
+                        letter-spacing:.1em;text-transform:uppercase;margin-left:10px">LBS × MGB — Sports Tournament</span>
+          </div>
+          <div style="display:flex;gap:14px;font-size:9.5px;color:#8a877d;font-family:'DM Mono',monospace;align-items:center">
+            <span class="bd-fs-legend"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#f5c518;margin-right:4px"></span>Team A won cat.</span>
+            <span class="bd-fs-legend"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#ea580c;margin-right:4px"></span>Team B won cat.</span>
+            <span class="bd-fs-legend"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#f59e0b;margin-right:4px"></span>Live now</span>
+            <span class="bd-fs-legend"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#3a3a34;margin-right:4px"></span>Not started</span>
+            <button id="bd-fs-btn" onclick="bdToggleFullscreen()" style="background:rgba(255,255,255,.06);
+                    color:#e8e6df;border:1px solid rgba(255,255,255,.16);border-radius:6px;padding:5px 10px;
+                    font-size:10px;font-weight:700;font-family:'DM Mono',monospace;cursor:pointer;letter-spacing:.04em">
+              ⛶ Full Screen
+            </button>
+          </div>
+        </div>
+        <div class="bd-fs-hero" style="display:block;text-align:center;margin:6px 0 30px">
+          <div style="font-size:13px;font-weight:800;letter-spacing:.16em;color:#8a877d;text-transform:uppercase;
+                      font-family:'DM Mono',monospace;margin-bottom:10px">LBS × MGB Sports Tournament</div>
+          <div style="font-size:46px;font-weight:800;color:#fff;letter-spacing:-0.01em;line-height:1.1">
+            🏸 LBS Olympics <span style="color:#d99a2b">Badminton!</span>
+          </div>
+          <div id="bd-fs-datetime" style="margin-top:12px;font-size:17px;color:#a8a59e;font-family:'DM Mono',monospace;
+                      letter-spacing:.05em"></div>
+        </div>
+        <div class="bd-fs-stage">
+          {live_section}
+        </div>
+      </div>
+      {overview_html}
+    </div>
+    <script>
+      // On the projector/kiosk page (live_only), the big jumbotron sizing
+      // is on by default — no need to press Full Screen just to get
+      // readable fonts. bdSetFsUi still runs on real fullscreenchange
+      // events (for the OS-level Fullscreen API path), but it should never
+      // shrink things back down below that baseline.
+      var BD_FORCE_BIG = {str(live_only).lower()};
+      function bdSetFsUi(active) {{
+        var el = document.getElementById('bd-live-now');
+        var btn = document.getElementById('bd-fs-btn');
+        if (el) el.classList.toggle('bd-fs', active || BD_FORCE_BIG);
+        if (btn) btn.innerHTML = active ? '⛶ Exit Full Screen' : '⛶ Full Screen';
+        var brand = document.querySelectorAll('.bd-fs-brand');
+        for (var i = 0; i < brand.length; i++) brand[i].style.display = active ? 'inline' : 'none';
+        // Header (title/date banner) now always shows, in or out of
+        // fullscreen — it used to be hidden until Full Screen was pressed.
+      }}
+      function bdToggleFullscreen() {{
+        var el = document.getElementById('bd-live-now');
+        if (!document.fullscreenElement && !document.webkitFullscreenElement) {{
+          if (el.requestFullscreen) {{ el.requestFullscreen(); }}
+          else if (el.webkitRequestFullscreen) {{ el.webkitRequestFullscreen(); }}
+        }} else {{
+          if (document.exitFullscreen) {{ document.exitFullscreen(); }}
+          else if (document.webkitExitFullscreen) {{ document.webkitExitFullscreen(); }}
+        }}
+      }}
+      document.addEventListener('fullscreenchange', function() {{
+        bdSetFsUi(!!document.fullscreenElement);
+      }});
+      document.addEventListener('webkitfullscreenchange', function() {{
+        bdSetFsUi(!!document.webkitFullscreenElement);
+      }});
+      setInterval(function() {{
+        var dt = document.getElementById('bd-fs-datetime');
+        if (dt) {{
+          var now = new Date();
+          var dateStr = now.toLocaleDateString([], {{weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'}});
+          var timeStr = now.toLocaleTimeString([], {{hour: '2-digit', minute: '2-digit', second: '2-digit'}});
+          dt.textContent = dateStr + '  ·  ' + timeStr;
+        }}
+      }}, 1000);
+    </script>
+    <style>
+      /* Jumbotron mode: pinned to the TOP (not vertically centered — with
+         only a couple of live matches that left a big empty gap above the
+         content instead of below it, which read as "the top is missing"),
+         warm gradient backdrop, everything scaled up via !important since
+         the per-cell sizes were set inline in Python for the normal
+         (embedded) monitor view. */
+      #bd-live-now.bd-fs {{
+        display: flex !important;
+        flex-direction: column !important;
+        justify-content: flex-start !important;
+        min-height: 100vh !important;
+        padding: 48px 64px !important;
+        background: radial-gradient(circle at 50% 10%, #1c1a14 0%, #0a0a08 65%) !important;
+        box-sizing: border-box !important;
+        overflow-y: auto !important;
+      }}
+      #bd-live-now.bd-fs .bd-fs-topbar {{ margin-bottom: 0 !important; }}
+      #bd-live-now.bd-fs .bd-fs-legend {{ font-size: 13px !important; }}
+      #bd-live-now.bd-fs #bd-fs-btn {{ font-size: 13px !important; padding: 8px 16px !important; }}
+      #bd-live-now.bd-fs .bd-fs-stage {{ display: flex !important; flex-direction: column !important; gap: 22px !important; }}
+      #bd-live-now.bd-fs .bd-fs-stage > div {{ margin-bottom: 0 !important; }}
+      #bd-live-now.bd-fs table {{ width: 100% !important; }}
+      #bd-live-now.bd-fs table th {{
+        font-size: 22px !important; padding: 16px 26px !important;
+      }}
+      #bd-live-now.bd-fs table td {{
+        font-size: 34px !important; padding: 18px 26px !important;
+      }}
+      #bd-live-now.bd-fs table td.bd-name-cell {{ font-size: 40px !important; }}
+      #bd-live-now.bd-fs table td.bd-tally-cell {{ font-size: 40px !important; color: #d99a2b !important; }}
+      #bd-live-now.bd-fs .bd-activity {{ padding: 22px 32px !important; margin-top: 24px !important; border-radius: 12px !important; }}
+      #bd-live-now.bd-fs .bd-activity-label {{ font-size: 15px !important; }}
+      #bd-live-now.bd-fs .bd-activity-cat {{ font-size: 30px !important; }}
+      #bd-live-now.bd-fs .bd-activity-cat span {{ font-size: 20px !important; }}
+      #bd-live-now.bd-fs .bd-activity-score {{ font-size: 56px !important; }}
+      #bd-live-now.bd-fs [style*="min-width:200px"] {{
+        border-radius: 18px !important; padding: 32px 36px !important;
+        box-shadow: 0 20px 60px rgba(0,0,0,.55) !important;
+      }}
+      /* The jumbo sizing above assumes ONE full-width spotlight card — that
+         was the only case that existed when this fullscreen mode was first
+         built. Once several ties are live simultaneously we switch to a
+         multi-column grid of compact tiles instead (see _render_bd_monitor_html),
+         and without this override those same 34px/40px font sizes and huge
+         32px/36px padding got forced onto every one of those much narrower
+         tiles too — the numbers dwarfed their cards and only a handful fit
+         per row before wrapping awkwardly. These higher-specificity rules
+         (scoped under .bd-fs-multi) win the cascade over the general rules
+         above and give the multi-tile grid its own, much more modest sizing
+         instead of inheriting single-card jumbo sizing wholesale.
+
+         Three size tiers instead of one fixed size: a fixed "big" tile size
+         that looked right for 2-3 simultaneous ties ran a busy 7+-live
+         session well past the bottom of the screen, needing a scroll to see
+         everything at once. -lg/-md/-sm (picked in Python by how many ties
+         are actually live right now — see _render_bd_monitor_html) shrink
+         the column width and every font/padding size together as the count
+         goes up, so a handful of ties still read big from across the room
+         while a busy multi-court session still fits on one screen. */
+      /* Full team names, never truncated with an ellipsis, at any tier —
+         a name like "Muhammad Afenddy & Nu..." cut off mid-word wasn't
+         readable from a distance. Letting it wrap onto a second line
+         instead (rather than the single-line ellipsis truncation used in
+         the normal, non-jumbo embedded view) makes the tile a bit taller
+         but keeps the whole name visible. */
+      #bd-live-now.bd-fs .bd-fs-multi .mon-team-name {{
+        white-space: normal !important; overflow: visible !important;
+        text-overflow: unset !important; word-break: break-word !important;
+        line-height: 1.15 !important;
+      }}
+      #bd-live-now.bd-fs .bd-fs-multi-lg {{ gap: 14px !important; }}
+      #bd-live-now.bd-fs .bd-fs-multi-lg table th {{ font-size: 17px !important; padding: 8px 14px !important; }}
+      #bd-live-now.bd-fs .bd-fs-multi-lg table td {{ font-size: 26px !important; padding: 10px 14px !important; }}
+      #bd-live-now.bd-fs .bd-fs-multi-lg table td.bd-name-cell {{ font-size: 30px !important; }}
+      #bd-live-now.bd-fs .bd-fs-multi-lg table td.bd-tally-cell {{ font-size: 30px !important; color: #d99a2b !important; }}
+      #bd-live-now.bd-fs .bd-fs-multi-lg [style*="min-width:200px"] {{
+        border-radius: 10px !important; padding: 20px !important; box-shadow: 0 8px 24px rgba(0,0,0,.4) !important;
+      }}
+
+      #bd-live-now.bd-fs .bd-fs-multi-md {{ gap: 10px !important; }}
+      #bd-live-now.bd-fs .bd-fs-multi-md table th {{ font-size: 13px !important; padding: 5px 10px !important; }}
+      #bd-live-now.bd-fs .bd-fs-multi-md table td {{ font-size: 18px !important; padding: 6px 10px !important; }}
+      #bd-live-now.bd-fs .bd-fs-multi-md table td.bd-name-cell {{ font-size: 20px !important; }}
+      #bd-live-now.bd-fs .bd-fs-multi-md table td.bd-tally-cell {{ font-size: 20px !important; color: #d99a2b !important; }}
+      #bd-live-now.bd-fs .bd-fs-multi-md [style*="min-width:200px"] {{
+        border-radius: 9px !important; padding: 13px !important; box-shadow: 0 6px 18px rgba(0,0,0,.4) !important;
+      }}
+
+      #bd-live-now.bd-fs .bd-fs-multi-sm {{ gap: 8px !important; }}
+      #bd-live-now.bd-fs .bd-fs-multi-sm table th {{ font-size: 10px !important; padding: 3px 7px !important; }}
+      #bd-live-now.bd-fs .bd-fs-multi-sm table td {{ font-size: 13px !important; padding: 4px 7px !important; }}
+      #bd-live-now.bd-fs .bd-fs-multi-sm table td.bd-name-cell {{ font-size: 14px !important; }}
+      #bd-live-now.bd-fs .bd-fs-multi-sm table td.bd-tally-cell {{ font-size: 14px !important; color: #d99a2b !important; }}
+      #bd-live-now.bd-fs .bd-fs-multi-sm [style*="min-width:200px"] {{
+        border-radius: 7px !important; padding: 8px !important; box-shadow: 0 4px 12px rgba(0,0,0,.4) !important;
+      }}
+      #bd-live-now:fullscreen {{ background: #0a0a08; }}
+      #bd-live-now:-webkit-full-screen {{ background: #0a0a08; }}
+      /* Themed scrollbar fallback: the compact category table only needs
+         to scroll in rare edge cases now (5 categories + an in-progress
+         tie-breaker, all at once), but when it does, a slim dark scrollbar
+         blends into the card instead of a jarring default OS scrollbar. */
+      .mon-tile-card {{ scrollbar-width: thin; scrollbar-color: #3a3a34 transparent; }}
+      .mon-tile-card::-webkit-scrollbar {{ height: 4px; }}
+      .mon-tile-card::-webkit-scrollbar-track {{ background: transparent; }}
+      .mon-tile-card::-webkit-scrollbar-thumb {{ background: #3a3a34; border-radius: 4px; }}
+    </style>
+    """
+    return html, len(live)
+
+
+def _live_autorefresh_control(key, default=15):
+    """Renders just the interval picker and returns the chosen value (0 =
+    off). Split from the actual sleep/rerun (see _live_autorefresh_wait
+    below) so callers can render the REST of the page's content first —
+    calling st.rerun() immediately halts the script right where it's
+    called, so if the sleep+rerun happened here, any code written after
+    this call (the round filter, the monitor HTML itself) would never
+    execute. That was the actual bug in an earlier version: the page
+    looked like it was stuck showing stale/wrong content forever, because
+    the monitor grid was never being reached before the rerun cut the
+    script off.
+    """
+    options = [10, 15, 20, 30, 0]
+    return st.selectbox(
+        "Auto-refresh", options, index=options.index(default),
+        format_func=lambda s: "Auto-refresh: Off" if s == 0 else f"Auto-refresh: every {s}s",
+        key=key, label_visibility="collapsed",
+    )
+
+
+def _live_autorefresh_wait(interval):
+    """Call this LAST, after every other bit of page content has already
+    been rendered. On event day this page gets put up on a screen and left
+    alone (no one is sitting there clicking around), so without this,
+    viewers would only ever see whatever score was on the screen the last
+    time someone happened to interact with it — Streamlit only re-renders
+    a page when a widget fires. Sleeping then calling st.rerun() forces
+    the WHOLE app script to run again every N seconds, which re-reads the
+    latest bd/pk state from the database and redraws the monitor with it,
+    so a score an umpire just entered on the admin side shows up here
+    within one interval without anyone touching this screen.
+
+    Implemented as plain time.sleep() + st.rerun() rather than pulling in
+    a separate autorefresh package: this only ever needs to support a
+    handful of projector/viewer devices with the page open at once for a
+    single-day event, so blocking each of those sessions' server thread
+    for a few seconds between reruns is cheap — and it avoids adding a new
+    dependency that could itself drift versions the way plain `streamlit`
+    already did once in this project (the selectbox DOM rewrite that broke
+    theme.py's CSS selectors). If this ever needs to scale to many more
+    simultaneous viewers, `streamlit-autorefresh` (a small community
+    component using a non-blocking JS timer instead of a server-side
+    sleep) would be the natural next step.
+    """
+    if interval:
+        st.caption(f"🔄 Refreshing every {interval}s so this stays live on the projector without anyone touching it.")
+        time.sleep(interval)
+        st.rerun()
+    else:
+        st.caption("🔄 Auto-refresh is off — reload the page manually to see new scores.")
+
+
+def render_badminton_monitor():
+    ui.page_header("Badminton", "Badminton — Live Monitor",
+                    "16 departments · Double elimination · First to 3 category wins", "Live", "green")
+    bd = state.load_bd()
+    champ = logic.bd_champion(bd)
+    if champ:
+        st.markdown(
+            f"<div style='text-align:center;padding:16px;background:linear-gradient(135deg,#0f1e33,#16283f);"
+            f"border-radius:12px;border:2px solid #d99a2b;color:#f5c518;font-size:20px;font-weight:800'>"
+            f"🏆 Champion — {champ}</div>", unsafe_allow_html=True,
+        )
+        st.markdown("")
+
+    view_col, refresh_col = st.columns([3, 1])
+    with view_col:
+        view = st.radio("View", ["🗂 Bracket View", "📺 Live Monitor"], horizontal=True,
+                         label_visibility="collapsed", key="bd_mon_view")
+
+    st.link_button("🖥️ Open Projector View ↗", "?kiosk=badminton",
+                    help="Opens a bare, chrome-free version of this monitor in a new tab — "
+                         "use the browser's own fullscreen (F11) on that tab for a projector/TV.")
+
+    if view == "🗂 Bracket View":
+        st.caption("Solid lines route winners forward; dashed lines route losers down to the losers bracket. "
+                    "This view is read-only — score from the Admin pages.")
+        html = bracket_svg.render_bracket_view_html(bd)
+        components.html(html, height=bracket_svg.canvas_size()["h"] + 40, scrolling=True)
+    else:
+        with refresh_col:
+            refresh_interval = _live_autorefresh_control("bd_mon_refresh_secs")
+        rounds = st.multiselect("Show rounds", logic.ALL_BD_ROUNDS, default=logic.ALL_BD_ROUNDS,
+                                 format_func=lambda r: logic.BD_ROUND_INFO[r]["label"], key="bd_mon_rounds")
+        html, _ = _render_bd_monitor_html(bd, rounds)
+        components.html(html, height=900, scrolling=True)
+        _live_autorefresh_wait(refresh_interval)
+
+
+def _pk_display(t1, t2, winner, games, label):
+    """Uniform display record for a pickleball match, whichever structure it
+    came from (group-stage match dict has no t1/t2 of its own — the pair
+    names live on the group roster — while a knockout tie carries t1/t2
+    directly). Every renderer below only ever touches this shape."""
+    return {"t1": t1, "t2": t2, "winner": winner, "games": games, "label": label}
+
+
+def _pk_status(d):
+    if d["winner"] is not None:
+        return "done"
+    if not d["t1"] or not d["t2"]:
+        return "pending"
+    active = any(g["finished"] or g["p1"] > 0 or g["p2"] > 0 for g in d["games"])
+    return "live" if active else "scheduled"
+
+
+def _pk_tally(games):
+    w1 = w2 = 0
+    for g in games:
+        if not g["finished"]:
+            continue
+        if g["p1"] > g["p2"]:
+            w1 += 1
+        elif g["p2"] > g["p1"]:
+            w2 += 1
+    return w1, w2
+
+
+def _pk_score_table_html(d, compact=True, show_names=False, show_tally=False, full_name=False):
+    """Same real-scoreboard-table approach as the badminton monitor's
+    _bd_score_table_html, minus the category grouping — a pickleball match
+    is just one best-of-3 game group, so each column is a single game."""
+    vis = logic.visible_games(d["games"])
+    games = [(gi, d["games"][gi]) for gi in vis]
+    if not games:
+        return ""
+
+    hdr_size = "9px" if compact else "13px"
+    cell_size = "11px" if compact else "20px"
+    cell_pad = "3px 7px" if compact else "10px 16px"
+    name_size = "11px" if compact else "16px"
+
+    t1name, t2name = d["t1"] or "TBD", d["t2"] or "TBD"
+    winner = d["winner"]
+    t1_color = "#f5c518" if winner == 1 else ("#6b6960" if winner == 2 else "#e8e6df")
+    t2_color = "#ea580c" if winner == 2 else ("#6b6960" if winner == 1 else "#e8e6df")
+
+    current_gi = None
+    if winner is None:
+        last_gi, last = games[-1]
+        if not last["finished"] and (last["p1"] > 0 or last["p2"] > 0):
+            current_gi = last_gi
+
+    name_hdr = f'<th style="padding:{cell_pad}"></th>' if show_names else ""
+    hdr_cells = name_hdr
+    for gi, g in games:
+        if g["finished"]:
+            color = "#f5c518" if g["p1"] > g["p2"] else ("#ea580c" if g["p2"] > g["p1"] else "#8a877d")
+        elif gi == current_gi:
+            color = "#f59e0b"
+        else:
+            color = "#8a877d"
+        hdr_cells += (
+            f'<th style="font-size:{hdr_size};font-family:\'DM Mono\',monospace;color:{color};'
+            f'font-weight:800;text-transform:uppercase;letter-spacing:.04em;padding:{cell_pad};'
+            f'border-bottom:1px solid #2a2a24;border-left:1px solid #2a2a24;text-align:center">G{gi+1}</th>'
+        )
+    tally_hdr = (
+        f'<th style="font-size:{hdr_size};font-family:\'DM Mono\',monospace;color:#d99a2b;font-weight:800;'
+        f'text-transform:uppercase;letter-spacing:.04em;padding:{cell_pad};border-bottom:1px solid #2a2a24;'
+        f'border-left:1px solid #2a2a24;text-align:center;white-space:nowrap">Games</th>'
+    ) if show_tally else ""
+    hdr_cells += tally_hdr
+
+    def team_row(slot, name, color, weight, tally):
+        cells = ""
+        if show_names:
+            wrap = "white-space:normal;word-break:break-word;max-width:260px" if full_name else "white-space:nowrap"
+            cells += (
+                f'<td class="pk-name-cell" style="padding:{cell_pad};font-size:{name_size};font-weight:800;color:{color};'
+                f'{wrap};text-align:left">{_truncate_name(name, maxlen=None if full_name else 22)}</td>'
+            )
+        for idx, (gi, g) in enumerate(games):
+            border = "border-left:1px solid #2a2a24;" if idx == 0 else ""
+            val = g["p1"] if slot == 1 else g["p2"]
+            cells += (
+                f'<td style="padding:{cell_pad};text-align:center;color:{color};font-weight:{weight};'
+                f'font-family:\'DM Mono\',monospace;font-size:{cell_size};{border}">{val}</td>'
+            )
+        if show_tally:
+            cells += (
+                f'<td class="pk-tally-cell" style="padding:{cell_pad};text-align:center;color:{color};font-weight:800;'
+                f'font-family:\'DM Mono\',monospace;font-size:{cell_size};border-left:1px solid #2a2a24">{tally}</td>'
+            )
+        return cells
+
+    w1, w2 = _pk_tally(d["games"])
+    row1 = team_row(1, t1name, t1_color, "800" if winner == 1 else "600", w1)
+    row2 = team_row(2, t2name, t2_color, "800" if winner == 2 else "600", w2)
+
+    return f"""
+    <table style="border-collapse:collapse;width:{"100%" if show_names else "auto"};margin-top:8px">
+      <thead><tr>{hdr_cells}</tr></thead>
+      <tbody>
+        <tr>{row1}</tr>
+        <tr>{row2}</tr>
+      </tbody>
+    </table>
+    """
+
+
+def _pk_mon_tile_html(d, big=False, full_name=False):
+    status = _pk_status(d)
+    t1 = _truncate_name(d["t1"] or "TBD", maxlen=None if full_name else 22)
+    t2 = _truncate_name(d["t2"] or "TBD", maxlen=None if full_name else 22)
+    w1, w2 = _pk_tally(d["games"])
+    border = "1px solid #f59e0b" if status == "live" else ("1px solid #2a2a24" if status != "done" else "1px solid #2f4f3a")
+    badge = ('<span style="background:#f59e0b;color:#111;font-size:9px;font-weight:800;padding:2px 6px;'
+             'border-radius:3px;letter-spacing:.03em">● LIVE</span>') if status == "live" else (
+             '<span style="color:#f5c518;font-size:10px;font-weight:700">✓ FINAL</span>' if status == "done" else "")
+    t1_color = "#f5c518" if (status == "done" and d["winner"] == 1) else ("#6b6960" if (status == "done" and d["winner"] == 2) else "#e8e6df")
+    t2_color = "#f5c518" if (status == "done" and d["winner"] == 2) else ("#6b6960" if (status == "done" and d["winner"] == 1) else "#e8e6df")
+    t1_weight = "700" if not (status == "done" and d["winner"] == 2) else "400"
+    t2_weight = "700" if not (status == "done" and d["winner"] == 1) else "400"
+    pad = "14px" if big else "10px"
+    name_size = "16px" if big else "13px"
+    score_size = "22px" if big else "17px"
+
+    activity_line = ""
+    activity_banner = ""
+    if status == "live":
+        vis = logic.visible_games(d["games"])
+        gi = vis[-1]
+        g = d["games"][gi]
+        act_size = "13px" if big else "11px"
+        pt_size = "16px" if big else "13px"
+        activity_line = f"""
+        <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a2a24;font-size:{act_size};
+                    color:#c9c6bd;font-family:'DM Mono',monospace;display:flex;justify-content:space-between;align-items:center">
+          <span>Game {gi + 1}</span>
+          <span style="font-weight:800;font-size:{pt_size};color:#f5c518">{g["p1"]}–{g["p2"]}</span>
+        </div>
+        """
+        activity_banner = f"""
+        <div class="pk-activity" style="margin-top:14px;padding:12px 18px;border-radius:8px;
+                    background:linear-gradient(90deg,rgba(245,158,11,.14),rgba(245,158,11,.03));
+                    border:1px solid rgba(245,158,11,.35);display:flex;justify-content:space-between;
+                    align-items:center;gap:14px">
+          <div>
+            <div class="pk-activity-label" style="font-size:10px;color:#f5c518;font-weight:800;
+                        text-transform:uppercase;letter-spacing:.08em;font-family:'DM Mono',monospace">
+              ● Currently Playing</div>
+            <div class="pk-activity-cat" style="font-size:18px;color:#fff;font-weight:800;margin-top:3px">
+              Game {gi + 1}
+            </div>
+          </div>
+          <div class="pk-activity-score" style="font-family:'DM Mono',monospace;font-weight:800;
+                      font-size:32px;color:#f5c518;white-space:nowrap;flex-shrink:0">{g["p1"]}–{g["p2"]}</div>
+        </div>
+        """
+
+    strip = _pk_score_table_html(d, compact=True, full_name=full_name) if status in ("live", "done") else ""
+
+    header_and_teams = f"""
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <span style="font-size:9px;color:#8a877d;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:.06em">
+          {d["label"]}</span>
+        {badge}
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:{name_size};font-weight:{t1_weight};color:{t1_color}">
+        <span class="mon-team-name" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:8px">{t1}</span>
+        <span style="font-family:'DM Mono',monospace;font-size:{score_size};font-weight:800;flex-shrink:0">{w1}</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:{name_size};font-weight:{t2_weight};color:{t2_color}">
+        <span class="mon-team-name" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:8px">{t2}</span>
+        <span style="font-family:'DM Mono',monospace;font-size:{score_size};font-weight:800;flex-shrink:0">{w2}</span>
+      </div>
+      {activity_line}
+    """
+
+    if big:
+        header_row = f"""
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+            <span style="font-size:10px;color:#8a877d;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:.06em">
+              {d["label"]}</span>
+            {badge}
+          </div>
+        """
+        table = _pk_score_table_html(d, compact=False, show_names=True, show_tally=True, full_name=full_name)
+        return f"""
+        <div style="background:#1c1c19;border:{border};border-radius:10px;padding:{pad};min-width:200px;max-width:100%;overflow-x:auto" class="mon-tile-card">
+          {header_row}
+          {table}
+          {activity_banner}
+        </div>
+        """
+
+    return f"""
+    <div style="background:#1c1c19;border:{border};border-radius:10px;padding:{pad};min-width:200px;max-width:100%;overflow-x:auto" class="mon-tile-card">
+      {header_and_teams}
+      {strip}
+    </div>
+    """
+
+
+def _pk_group_standings_html(pk):
+    cards = ""
+    for grp in ["A", "B", "C", "D"]:
+        standings = logic.pk_standings(pk, grp)
+        rows = ""
+        for r, s in enumerate(standings):
+            name = s["name"] or f"Pair {s['idx']+1}"
+            color = "#f5c518" if r < 4 else "#8a877d"
+            weight = "700" if r < 4 else "400"
+            rows += f"""
+            <tr>
+              <td style="padding:5px 8px;font-family:'DM Mono',monospace;color:{color};font-weight:{weight};font-size:11px">{r+1}</td>
+              <td style="padding:5px 8px;color:{color};font-weight:{weight};font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:150px">{name}</td>
+              <td style="padding:5px 8px;font-family:'DM Mono',monospace;color:{color};font-weight:{weight};font-size:11px;text-align:right">{s['mw']}-{s['ml']}</td>
+            </tr>
+            """
+        cards += f"""
+        <div style="background:#1c1c19;border:1px solid #2a2a24;border-radius:10px;padding:14px;min-width:210px">
+          <div style="font-size:11px;font-weight:800;letter-spacing:.06em;color:#d99a2b;text-transform:uppercase;
+                      font-family:'DM Mono',monospace;margin-bottom:8px">Group {grp}</div>
+          <table style="width:100%;border-collapse:collapse">{rows}</table>
+        </div>
+        """
+    return f'<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:22px">{cards}</div>'
+
+
+def _render_pk_monitor_html(pk, rounds, live_only=False):
+    show_group = "GROUP" in rounds
+    live = []
+
+    if show_group:
+        for grp in ["A", "B", "C", "D"]:
+            pairs = pk["groups"][grp]
+            n = len(pairs)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    m = logic.pk_get_match_if_exists(pk, grp, i, j)
+                    if not m:
+                        continue
+                    t1 = pairs[i]["name"] or f"Pair {i+1}"
+                    t2 = pairs[j]["name"] or f"Pair {j+1}"
+                    d = _pk_display(t1, t2, m["winner"], m["games"], f"Group {grp}")
+                    if _pk_status(d) == "live":
+                        live.append(d)
+
+    for tid, tie in pk["ko"].items():
+        r = "GF" if tid == "GF" else tid.split("_")[0]
+        if r not in rounds:
+            continue
+        d = _pk_display(tie["t1"], tie["t2"], tie["winner"], tie["games"], logic.PK_ROUND_LABELS[r])
+        if _pk_status(d) == "live":
+            live.append(d)
+
+    if live:
+        # Same fix as the badminton monitor: only spotlight a single live
+        # match as a full "big" jumbo card. Pickleball's group stage
+        # routinely has several matches live at once across 4 groups — with
+        # the old code every one of them was forced into the wide "big"
+        # layout, then squeezed into a flex row, causing team names to
+        # overflow each card's edge and the score table to get clipped so
+        # only a sliver (often just the last game's column) stayed visible.
+        if len(live) == 1:
+            spotlight_width = "900px" if live_only else "520px"
+            tiles = f'<div style="width:100%;max-width:{spotlight_width}">{_pk_mon_tile_html(live[0], big=True, full_name=live_only)}</div>'
+            live_section = f'<div style="margin-bottom:22px">{tiles}</div>'
+        else:
+            # Same fix as the badminton monitor: scale tile size down as the
+            # live count goes up — pickleball routinely has matches running
+            # in all 4 groups at once, and a fixed "big" tile size for that
+            # many tiles ran well past the bottom of the screen.
+            n = len(live)
+            tier = "lg" if n <= 3 else ("md" if n <= 6 else "sm")
+            cols = _balanced_grid_cols(n)
+            tiles = "".join(_pk_mon_tile_html(d, full_name=live_only) for d in live)
+            live_section = (
+                f'<div class="pk-fs-multi pk-fs-multi-{tier}" style="display:grid;'
+                f'grid-template-columns:repeat({cols},1fr) !important;'
+                f'gap:12px;margin-bottom:22px">{tiles}</div>'
+            )
+    else:
+        live_section = '<div style="color:#8a877d;font-size:13px;margin-bottom:22px">No matches currently in progress.</div>'
+
+    sections = ""
+    if show_group and not live_only:
+        sections += f"""
+        <div style="margin-bottom:20px">
+          <div style="font-size:11px;color:#8a877d;text-transform:uppercase;letter-spacing:.08em;
+                      font-family:'DM Mono',monospace;margin-bottom:10px">Group Standings</div>
+          {_pk_group_standings_html(pk)}
+        </div>
+        """
+
+    for r in ["K1", "K2", "K3", "GF"]:
+        if live_only or r not in rounds:
+            continue
+        ids = [tid for tid in pk["ko"] if (tid.startswith(r + "_") or (r == "GF" and tid == "GF"))]
+        if not ids:
+            continue
+        ids = sorted(ids, key=lambda t: int(t.split("_")[1]) if "_" in t else 0)
+        tiles = ""
+        for tid in ids:
+            tie = pk["ko"][tid]
+            d = _pk_display(tie["t1"], tie["t2"], tie["winner"], tie["games"],
+                             bracket_svg.PK_MATCH_LABELS.get(tid, tid))
+            tiles += _pk_mon_tile_html(d)
+        sections += f"""
+        <div style="margin-bottom:20px">
+          <div style="font-size:11px;color:#8a877d;text-transform:uppercase;letter-spacing:.08em;
+                      font-family:'DM Mono',monospace;margin-bottom:10px">{logic.PK_ROUND_LABELS[r]}</div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px">{tiles}</div>
+        </div>
+        """
+
+    overview_html = "" if live_only else f"""
+      <div style="color:#8a877d;font-size:11px;text-transform:uppercase;letter-spacing:.08em;
+                  font-family:'DM Mono',monospace;margin-bottom:12px">Tournament Overview</div>
+      {sections}
+    """
+    html = f"""
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <div style="color-scheme:dark;background:#111110;padding:20px;border-radius:12px;font-family:'Inter',sans-serif;min-height:850px">
+      <div id="pk-live-now" class="{'pk-fs' if live_only else ''}">
+        <div class="pk-fs-topbar" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:6px">
+          <div style="display:flex;align-items:center;gap:8px">
+            <span style="width:8px;height:8px;border-radius:50%;background:#f43f5e;display:inline-block"></span>
+            <span style="color:#e8e6df;font-size:12px;font-weight:800;letter-spacing:.06em;text-transform:uppercase">Live Now</span>
+            <span class="pk-fs-brand" style="display:none;color:#8a877d;font-size:12px;font-family:'DM Mono',monospace;
+                        letter-spacing:.1em;text-transform:uppercase;margin-left:10px">LBS × MGB — Sports Tournament</span>
+          </div>
+          <div style="display:flex;gap:14px;font-size:9.5px;color:#8a877d;font-family:'DM Mono',monospace;align-items:center">
+            <span class="pk-fs-legend"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#f5c518;margin-right:4px"></span>Pair A won game</span>
+            <span class="pk-fs-legend"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#ea580c;margin-right:4px"></span>Pair B won game</span>
+            <span class="pk-fs-legend"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#f59e0b;margin-right:4px"></span>Live now</span>
+            <span class="pk-fs-legend"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#3a3a34;margin-right:4px"></span>Not started</span>
+            <button id="pk-fs-btn" onclick="pkToggleFullscreen()" style="background:rgba(255,255,255,.06);
+                    color:#e8e6df;border:1px solid rgba(255,255,255,.16);border-radius:6px;padding:5px 10px;
+                    font-size:10px;font-weight:700;font-family:'DM Mono',monospace;cursor:pointer;letter-spacing:.04em">
+              ⛶ Full Screen
+            </button>
+          </div>
+        </div>
+        <div class="pk-fs-hero" style="display:block;text-align:center;margin:6px 0 30px">
+          <div style="font-size:13px;font-weight:800;letter-spacing:.16em;color:#8a877d;text-transform:uppercase;
+                      font-family:'DM Mono',monospace;margin-bottom:10px">LBS × MGB Sports Tournament</div>
+          <div style="font-size:46px;font-weight:800;color:#fff;letter-spacing:-0.01em;line-height:1.1">
+            🏓 LBS Olympics <span style="color:#d99a2b">Pickleball!</span>
+          </div>
+          <div id="pk-fs-datetime" style="margin-top:12px;font-size:17px;color:#a8a59e;font-family:'DM Mono',monospace;
+                      letter-spacing:.05em"></div>
+        </div>
+        <div class="pk-fs-stage">
+          {live_section}
+        </div>
+      </div>
+      {overview_html}
+    </div>
+    <script>
+      var PK_FORCE_BIG = {str(live_only).lower()};
+      function pkSetFsUi(active) {{
+        var el = document.getElementById('pk-live-now');
+        var btn = document.getElementById('pk-fs-btn');
+        if (el) el.classList.toggle('pk-fs', active || PK_FORCE_BIG);
+        if (btn) btn.innerHTML = active ? '⛶ Exit Full Screen' : '⛶ Full Screen';
+        var brand = document.querySelectorAll('.pk-fs-brand');
+        for (var i = 0; i < brand.length; i++) brand[i].style.display = active ? 'inline' : 'none';
+        // Header (title/date banner) now always shows, in or out of
+        // fullscreen — it used to be hidden until Full Screen was pressed.
+      }}
+      function pkToggleFullscreen() {{
+        var el = document.getElementById('pk-live-now');
+        if (!document.fullscreenElement && !document.webkitFullscreenElement) {{
+          if (el.requestFullscreen) {{ el.requestFullscreen(); }}
+          else if (el.webkitRequestFullscreen) {{ el.webkitRequestFullscreen(); }}
+        }} else {{
+          if (document.exitFullscreen) {{ document.exitFullscreen(); }}
+          else if (document.webkitExitFullscreen) {{ document.webkitExitFullscreen(); }}
+        }}
+      }}
+      document.addEventListener('fullscreenchange', function() {{
+        pkSetFsUi(!!document.fullscreenElement);
+      }});
+      document.addEventListener('webkitfullscreenchange', function() {{
+        pkSetFsUi(!!document.webkitFullscreenElement);
+      }});
+      setInterval(function() {{
+        var dt = document.getElementById('pk-fs-datetime');
+        if (dt) {{
+          var now = new Date();
+          var dateStr = now.toLocaleDateString([], {{weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'}});
+          var timeStr = now.toLocaleTimeString([], {{hour: '2-digit', minute: '2-digit', second: '2-digit'}});
+          dt.textContent = dateStr + '  ·  ' + timeStr;
+        }}
+      }}, 1000);
+    </script>
+    <style>
+      /* Pinned to the top — see the matching comment on #bd-live-now.bd-fs. */
+      #pk-live-now.pk-fs {{
+        display: flex !important;
+        flex-direction: column !important;
+        justify-content: flex-start !important;
+        min-height: 100vh !important;
+        padding: 48px 64px !important;
+        background: radial-gradient(circle at 50% 10%, #1c1a14 0%, #0a0a08 65%) !important;
+        box-sizing: border-box !important;
+        overflow-y: auto !important;
+      }}
+      #pk-live-now.pk-fs .pk-fs-topbar {{ margin-bottom: 0 !important; }}
+      #pk-live-now.pk-fs .pk-fs-legend {{ font-size: 13px !important; }}
+      #pk-live-now.pk-fs #pk-fs-btn {{ font-size: 13px !important; padding: 8px 16px !important; }}
+      #pk-live-now.pk-fs .pk-fs-stage {{ display: flex !important; flex-direction: column !important; gap: 22px !important; }}
+      #pk-live-now.pk-fs .pk-fs-stage > div {{ margin-bottom: 0 !important; }}
+      #pk-live-now.pk-fs table {{ width: 100% !important; }}
+      #pk-live-now.pk-fs table th {{
+        font-size: 22px !important; padding: 16px 26px !important;
+      }}
+      #pk-live-now.pk-fs table td {{
+        font-size: 34px !important; padding: 18px 26px !important;
+      }}
+      #pk-live-now.pk-fs table td.pk-name-cell {{ font-size: 40px !important; }}
+      #pk-live-now.pk-fs table td.pk-tally-cell {{ font-size: 40px !important; color: #d99a2b !important; }}
+      #pk-live-now.pk-fs .pk-activity {{ padding: 22px 32px !important; margin-top: 24px !important; border-radius: 12px !important; }}
+      #pk-live-now.pk-fs .pk-activity-label {{ font-size: 15px !important; }}
+      #pk-live-now.pk-fs .pk-activity-cat {{ font-size: 30px !important; }}
+      #pk-live-now.pk-fs .pk-activity-score {{ font-size: 56px !important; }}
+      #pk-live-now.pk-fs [style*="min-width:200px"] {{
+        border-radius: 18px !important; padding: 32px 36px !important;
+        box-shadow: 0 20px 60px rgba(0,0,0,.55) !important;
+      }}
+      /* Same fix as the badminton monitor: the jumbo sizing above assumes
+         ONE full-width spotlight card. With several matches live at once
+         we switch to a multi-column grid of compact tiles instead, and
+         these higher-specificity overrides (scoped under .pk-fs-multi-*)
+         give that grid its own modest sizing instead of inheriting the
+         single-card jumbo fonts/padding, which was dwarfing every tile's
+         numbers and only leaving room for a couple of columns per row.
+
+         Three size tiers instead of one fixed size — see the matching
+         comment on .bd-fs-multi-*: pickleball routinely has matches live
+         in all 4 groups plus knockout ties at once, and a fixed "big" tile
+         size that suited 2-3 live matches ran a busy 7+-live session well
+         past the bottom of the screen. -lg/-md/-sm (picked in Python by how
+         many matches are actually live right now — see
+         _render_pk_monitor_html) shrink the column width and every
+         font/padding size together as the live count goes up. */
+      /* Same as the badminton monitor — see that comment. */
+      #pk-live-now.pk-fs .pk-fs-multi .mon-team-name {{
+        white-space: normal !important; overflow: visible !important;
+        text-overflow: unset !important; word-break: break-word !important;
+        line-height: 1.15 !important;
+      }}
+      #pk-live-now.pk-fs .pk-fs-multi-lg {{ gap: 14px !important; }}
+      #pk-live-now.pk-fs .pk-fs-multi-lg table th {{ font-size: 17px !important; padding: 8px 14px !important; }}
+      #pk-live-now.pk-fs .pk-fs-multi-lg table td {{ font-size: 26px !important; padding: 10px 14px !important; }}
+      #pk-live-now.pk-fs .pk-fs-multi-lg table td.pk-name-cell {{ font-size: 30px !important; }}
+      #pk-live-now.pk-fs .pk-fs-multi-lg table td.pk-tally-cell {{ font-size: 30px !important; color: #d99a2b !important; }}
+      #pk-live-now.pk-fs .pk-fs-multi-lg [style*="min-width:200px"] {{
+        border-radius: 10px !important; padding: 20px !important; box-shadow: 0 8px 24px rgba(0,0,0,.4) !important;
+      }}
+
+      #pk-live-now.pk-fs .pk-fs-multi-md {{ gap: 10px !important; }}
+      #pk-live-now.pk-fs .pk-fs-multi-md table th {{ font-size: 13px !important; padding: 5px 10px !important; }}
+      #pk-live-now.pk-fs .pk-fs-multi-md table td {{ font-size: 18px !important; padding: 6px 10px !important; }}
+      #pk-live-now.pk-fs .pk-fs-multi-md table td.pk-name-cell {{ font-size: 20px !important; }}
+      #pk-live-now.pk-fs .pk-fs-multi-md table td.pk-tally-cell {{ font-size: 20px !important; color: #d99a2b !important; }}
+      #pk-live-now.pk-fs .pk-fs-multi-md [style*="min-width:200px"] {{
+        border-radius: 9px !important; padding: 13px !important; box-shadow: 0 6px 18px rgba(0,0,0,.4) !important;
+      }}
+
+      #pk-live-now.pk-fs .pk-fs-multi-sm {{ gap: 8px !important; }}
+      #pk-live-now.pk-fs .pk-fs-multi-sm table th {{ font-size: 10px !important; padding: 3px 7px !important; }}
+      #pk-live-now.pk-fs .pk-fs-multi-sm table td {{ font-size: 13px !important; padding: 4px 7px !important; }}
+      #pk-live-now.pk-fs .pk-fs-multi-sm table td.pk-name-cell {{ font-size: 14px !important; }}
+      #pk-live-now.pk-fs .pk-fs-multi-sm table td.pk-tally-cell {{ font-size: 14px !important; color: #d99a2b !important; }}
+      #pk-live-now.pk-fs .pk-fs-multi-sm [style*="min-width:200px"] {{
+        border-radius: 7px !important; padding: 8px !important; box-shadow: 0 4px 12px rgba(0,0,0,.4) !important;
+      }}
+      #pk-live-now:fullscreen {{ background: #0a0a08; }}
+      #pk-live-now:-webkit-full-screen {{ background: #0a0a08; }}
+      .mon-tile-card {{ scrollbar-width: thin; scrollbar-color: #3a3a34 transparent; }}
+      .mon-tile-card::-webkit-scrollbar {{ height: 4px; }}
+      .mon-tile-card::-webkit-scrollbar-track {{ background: transparent; }}
+      .mon-tile-card::-webkit-scrollbar-thumb {{ background: #3a3a34; border-radius: 4px; }}
+    </style>
+    """
+    return html, len(live)
+
+
+def render_pickleball_monitor():
+    ui.page_header("Pickleball", "Pickleball — Live Monitor",
+                    "22 pairs · 4 groups · Top 4 advance · Mixed doubles", "Live", "green")
+    pk = state.load_pk()
+    champ = logic.pk_champion(pk)
+    if champ:
+        st.markdown(
+            f"<div style='text-align:center;padding:16px;background:linear-gradient(135deg,#0f1e33,#16283f);"
+            f"border-radius:12px;border:2px solid #d99a2b;color:#f5c518;font-size:20px;font-weight:800'>"
+            f"🏆 Champion — {champ}</div>", unsafe_allow_html=True,
+        )
+        st.markdown("")
+
+    view_col, refresh_col = st.columns([3, 1])
+    with view_col:
+        view = st.radio("View", ["🗂 Bracket View", "📺 Live Monitor"], horizontal=True,
+                         label_visibility="collapsed", key="pk_mon_view")
+
+    st.link_button("🖥️ Open Projector View ↗", "?kiosk=pickleball",
+                    help="Opens a bare, chrome-free version of this monitor in a new tab — "
+                         "use the browser's own fullscreen (F11) on that tab for a projector/TV.")
+
+    if view == "🗂 Bracket View":
+        st.caption("Solid lines route winners forward through the Round of 16 → Quarter-Final → Semi-Final → Final. "
+                    "This view is read-only — score from the Admin pages.")
+        html = bracket_svg.render_pk_bracket_view_html(pk)
+        components.html(html, height=bracket_svg.pk_canvas_size()["h"] + 40, scrolling=True)
+    else:
+        with refresh_col:
+            refresh_interval = _live_autorefresh_control("pk_mon_refresh_secs")
+        rounds = st.multiselect("Show rounds", logic.ALL_PK_ROUNDS, default=logic.ALL_PK_ROUNDS,
+                                 format_func=lambda r: logic.PK_ROUND_LABELS[r], key="pk_mon_rounds")
+        html, _ = _render_pk_monitor_html(pk, rounds)
+        components.html(html, height=900, scrolling=True)
+        _live_autorefresh_wait(refresh_interval)
+
+
+def _kiosk_iframe_height(n_live):
+    """Estimates how tall the kiosk page's iframe needs to be to fit every
+    live match without an inner scrollbar — a fixed height (700px) was
+    fine for 1-2 matches but left 6-8 simultaneous matches needing to
+    scroll INSIDE the black box, which defeats the point of a kiosk/
+    projector display nobody's meant to touch. Mirrors the same tier/
+    column logic the tile grid itself uses (_balanced_grid_cols, and the
+    lg/md/sm size tiers) so the estimate tracks whatever's actually
+    rendered rather than drifting out of sync with it. Erring generous
+    rather than exact is fine here — any leftover space is just more of
+    the matching black background, not a visible gap."""
+    if n_live == 0:
+        return 500
+    if n_live == 1:
+        return 900
+    cols = _balanced_grid_cols(n_live)
+    rows = -(-n_live // cols)  # ceil division
+    tier = "lg" if n_live <= 3 else ("md" if n_live <= 6 else "sm")
+    row_height = {"lg": 430, "md": 300, "sm": 220}[tier]
+    return 260 + rows * row_height
+
+
+def _kiosk_bracket_html(sport, phase="all"):
+    """Wraps the (fairly large — the full double-elim tree is ~1800x1700px
+    for badminton) bracket SVG/HTML in a header matching the Live Monitor's
+    branding, plus a scale-to-fit wrapper so the bracket lands inside the
+    kiosk viewport instead of needing to scroll around a projector screen
+    to see the later rounds — which is what the raw canvas-sized output
+    looked like before this.
+
+    Fitting the WHOLE double-elim tree (winners + losers bracket stacked)
+    into one screen at once made every card's text tiny — the canvas is
+    nearly as tall as it is wide, but a projector screen is much wider
+    than it is tall, so height was always the limiting dimension and the
+    fitted scale came out small. phase="wb"/"lb" crops to just that half
+    (with a little overlap around the middle so the Grand Final card,
+    which sits right at the boundary between the two halves, shows up
+    fully in both crops) — half the height to fit into the same box
+    roughly doubles the usable scale. _render_kiosk_page alternates
+    between the two halves on successive bracket appearances. Pickleball's
+    single-elimination bracket is far shorter to begin with (~975px vs
+    badminton's ~1750px) and was already a reasonable fit uncropped, so
+    phase is a no-op there (always the whole thing).
+    """
+    if sport == "bd":
+        bd = state.load_bd()
+        inner = bracket_svg.render_bracket_view_html(bd)
+        size = bracket_svg.canvas_size()
+        icon, name = "🏸", "Badminton"
+        w, h = size["w"], size["h"]
+        overlap = 90
+        if phase == "wb":
+            crop_y0, crop_y1 = 0, h / 2 + overlap
+        elif phase == "lb":
+            crop_y0, crop_y1 = h / 2 - overlap, h
+        else:
+            crop_y0, crop_y1 = 0, h
+    else:
+        pk = state.load_pk()
+        inner = bracket_svg.render_pk_bracket_view_html(pk)
+        size = bracket_svg.pk_canvas_size()
+        icon, name = "🏓", "Pickleball"
+        w, h = size["w"], size["h"]
+        crop_y0, crop_y1 = 0, h
+    crop_h = crop_y1 - crop_y0
+
+    header = f"""
+    <div style="padding:20px 28px 4px;text-align:center">
+      <div style="font-size:11px;font-weight:800;letter-spacing:.16em;color:#8a877d;text-transform:uppercase;
+                  font-family:'DM Mono',monospace;margin-bottom:6px">LBS × MGB Sports Tournament</div>
+      <div style="font-size:28px;font-weight:800;color:#fff;letter-spacing:-0.01em">
+        {icon} LBS Olympics {name}! <span style="color:#d99a2b">Bracket</span>
+        {f'<span style="color:#8a877d;font-size:18px">&nbsp;·&nbsp;{"Winners" if phase == "wb" else "Losers"} Bracket</span>' if phase in ("wb", "lb") else ""}
+      </div>
+    </div>
+    """
+    return f"""
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <div style="background:#0a0a08;min-height:100vh;box-sizing:border-box">
+      {header}
+      <div id="bv-fit-outer" style="width:100%;height:calc(100vh - 110px);overflow:hidden;
+                  display:flex;align-items:flex-start;justify-content:center">
+        <div id="bv-fit-inner" style="width:{w}px;height:{crop_h}px;overflow:hidden;transform-origin:top center">
+          <div style="position:relative;top:-{crop_y0}px">{inner}</div>
+        </div>
+      </div>
+    </div>
+    <script>
+      function bvFit() {{
+        var outer = document.getElementById('bv-fit-outer');
+        var inner = document.getElementById('bv-fit-inner');
+        if (!outer || !inner) return;
+        var scale = Math.min(outer.clientWidth / {w}, outer.clientHeight / {crop_h}, 1);
+        inner.style.transform = 'scale(' + scale + ')';
+      }}
+      bvFit();
+      window.addEventListener('resize', bvFit);
+      setTimeout(bvFit, 200);
+    </script>
+    """
+
+
+def _render_kiosk_page(sport):
+    """Bare, chrome-free page meant to be opened on its own — on a
+    projector or a dedicated kiosk laptop — instead of navigating to the
+    Live Monitor tab inside the full app. There's no sidebar, header, or
+    nav rendered here at all, so there's nothing for the auto-refresh cycle
+    to have to hide or re-hide on every rerun. And because this page never
+    builds that chrome to begin with, the browser's OWN fullscreen (F11 on
+    Windows/Linux, Ctrl+Cmd+F on Mac) can be used on the tab and it'll stay
+    clean through every refresh — browser-level fullscreen isn't tied to
+    any on-page element the way the JS Fullscreen API is, so it isn't
+    affected by this page's content reloading underneath it.
+
+    Alternates between the Live Monitor and Bracket View — see the timing
+    comment further down for how/why.
+    """
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"],
+        [data-testid="stHeader"], [data-testid="stToolbar"],
+        [data-testid="stStatusWidget"], footer, #MainMenu { display: none !important; }
+        [data-testid="stAppViewContainer"] { margin-left: 0 !important; }
+        .block-container { padding: 0 !important; max-width: 100% !important; }
+        .stApp { background: #0a0a08 !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    # Alternates between the Live Monitor and the Bracket View on a timer,
+    # weighted toward the live monitor (that's what most people actually
+    # want up on the projector most of the time) with the bracket popping
+    # up periodically for overall context. Purely time-based (wall clock
+    # via time.time(), not session_state) rather than counting reruns —
+    # session_state is per-tab, so counting reruns would let two projector
+    # tabs (or a projector tab plus someone's laptop open to the same
+    # kiosk URL) drift out of sync with each other and show different
+    # views at the same moment; time.time() is the same for everyone,
+    # so every screen showing this page lands on the same phase together.
+    CYCLE_SECONDS = 15   # matches the refresh interval below
+    SLOTS_PER_CYCLE = 5  # 1 bracket slot for every 4 live-monitor slots
+    slot = int(time.time() // CYCLE_SECONDS) % SLOTS_PER_CYCLE
+    show_bracket = slot == SLOTS_PER_CYCLE - 1
+
+    if show_bracket:
+        # For badminton, alternate which HALF of the bracket shows on
+        # successive appearances (see _kiosk_bracket_html's docstring for
+        # why: fitting the whole double-elim tree on screen made the text
+        # tiny). Counts full trips around the cycle rather than slots, so
+        # it flips exactly once per bracket appearance, not partway through
+        # the 15s it's on screen for.
+        cycle_no = int(time.time() // (CYCLE_SECONDS * SLOTS_PER_CYCLE))
+        phase = ("wb" if cycle_no % 2 == 0 else "lb") if sport == "bd" else "all"
+        html = _kiosk_bracket_html(sport, phase=phase)
+        components.html(html, height=900, scrolling=False)
+    else:
+        if sport == "bd":
+            bd = state.load_bd()
+            html, n_live = _render_bd_monitor_html(bd, logic.ALL_BD_ROUNDS, live_only=True)
+        else:
+            pk = state.load_pk()
+            html, n_live = _render_pk_monitor_html(pk, logic.ALL_PK_ROUNDS, live_only=True)
+        components.html(html, height=_kiosk_iframe_height(n_live), scrolling=True)
+
+    time.sleep(CYCLE_SECONDS)
+    st.rerun()
+
+
+def render_badminton_kiosk():
+    _render_kiosk_page("bd")
+
+
+def render_pickleball_kiosk():
+    _render_kiosk_page("pk")

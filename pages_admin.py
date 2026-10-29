@@ -1,0 +1,765 @@
+from functools import partial
+
+import streamlit as st
+
+import auth
+import db
+import logic
+import state
+import ui
+
+PK_PTS = 15  # every pickleball game is to 15 pts; best-of-3 for Group/R16/QF, best-of-5 for Semis & Final (see logic.PK_BO5_ROUNDS)
+
+
+def _render_game(gi, g, key_prefix, on_minus, on_plus, on_set, on_finish, on_reopen,
+                  pts_target, t1_name, t2_name):
+    """Render one game's score_row, collapsing it into a one-line summary
+    once it's finished so umpires scrolling a long tie/match only have to
+    look at (and scroll past) the games that are still open.
+    A closed game shows "Game N · 15-8 · Team A" so the umpire can confirm
+    the result at a glance without opening it; an open game renders in
+    full immediately, unfolded, so it's the thing that gets attention."""
+    label = f"Game {gi + 1}"
+    if g["finished"]:
+        winner = t1_name if g["p1"] > g["p2"] else t2_name
+        summary = f"✅ {label} · {g['p1']}–{g['p2']} · {winner}"
+        # key is id-based, not built from the label text: the label changes
+        # every time the score changes, and an expander with no key (or a
+        # key derived from its own label) gets treated as a brand-new widget
+        # on that rerun — which resets it back to expanded=False regardless
+        # of whether the umpire had it open. A stable key keeps Streamlit
+        # tracking the SAME widget across reruns, so the open/closed state
+        # the umpire chose survives every score update.
+        with st.expander(summary, expanded=False, key=f"exp_{key_prefix}"):
+            ui.score_row(label, g, on_minus=on_minus, on_plus=on_plus, on_set=on_set,
+                         on_finish=on_finish, on_reopen=on_reopen, pts_target=pts_target,
+                         key_prefix=key_prefix, t1_name=t1_name, t2_name=t2_name)
+    else:
+        ui.score_row(label, g, on_minus=on_minus, on_plus=on_plus, on_set=on_set,
+                     on_finish=on_finish, on_reopen=on_reopen, pts_target=pts_target,
+                     key_prefix=key_prefix, t1_name=t1_name, t2_name=t2_name)
+
+
+def _render_game_plain(gi, g, key_prefix, on_minus, on_plus, on_set, on_finish, on_reopen,
+                        pts_target, t1_name, t2_name):
+    """Same as _render_game but never wraps in its own expander — used
+    inside a badminton category that's already collapsed as a whole (see
+    _render_bd_tie_editor), so a finished game doesn't get double-nested
+    inside two expanders (category expander > game expander) with nothing
+    left to show at the outer level but another fold."""
+    ui.score_row(f"Game {gi + 1}", g, on_minus=on_minus, on_plus=on_plus, on_set=on_set,
+                 on_finish=on_finish, on_reopen=on_reopen, pts_target=pts_target,
+                 key_prefix=key_prefix, t1_name=t1_name, t2_name=t2_name)
+
+
+# ───────────────────────── badminton callbacks ─────────────────────────
+
+def _bd_team_change(tie_id, which, key):
+    val = st.session_state[key]
+    if val == ui.CLEAR_OPTION:
+        # Sentinel picked from the dropdown to unassign a team — normalize
+        # both the saved value and the widget's own state back to None so
+        # the box shows its placeholder again on the next render, instead
+        # of getting stuck displaying the literal "— Clear / unassign —" text.
+        val = None
+        st.session_state[key] = None
+    bd = state.load_bd()
+    logic.bd_set_team(bd, tie_id, which, val)
+    state.save_bd(bd, actor=auth.actor_name(), action=f"set_team:{tie_id}:{which}")
+
+
+def _bd_point_cb(tie_id, ci, gi, who, delta):
+    bd = state.load_bd()
+    logic.bd_point(bd, tie_id, ci, gi, who, delta)
+    state.save_bd(bd, actor=auth.actor_name(), action=f"point:{tie_id}")
+
+
+def _bd_score_set_cb(tie_id, ci, gi, who, key):
+    bd = state.load_bd()
+    logic.bd_set_point(bd, tie_id, ci, gi, who, st.session_state[key])
+    state.save_bd(bd, actor=auth.actor_name(), action=f"set_score:{tie_id}")
+
+
+def _bd_finish_cb(tie_id, ci, gi):
+    bd = state.load_bd()
+    logic.bd_finish_game(bd, tie_id, ci, gi)
+    state.save_bd(bd, actor=auth.actor_name(), action=f"finish:{tie_id}")
+
+
+def _bd_reopen_cb(tie_id, ci, gi):
+    bd = state.load_bd()
+    logic.bd_reopen_game(bd, tie_id, ci, gi)
+    state.save_bd(bd, actor=auth.actor_name(), action=f"reopen:{tie_id}")
+
+
+def _bd_reset_tie_cb(tie_id):
+    bd = state.load_bd()
+    logic.bd_reset_tie(bd, tie_id)
+    state.save_bd(bd, actor=auth.actor_name(), action=f"reset_tie:{tie_id}")
+
+
+import streamlit.components.v1 as components
+
+import bracket_svg
+
+
+def _render_backup_restore_panel(sport):
+    """Export/restore just ONE sport's bracket data — scoped by `sport`
+    ("bd" for Badminton, "pk" for Pickleball) so the Pickleball admin page
+    doesn't back up (or let you accidentally overwrite) Badminton's data,
+    and vice versa. Each sport's admin page calls this with its own key.
+    Handy as a safety net before hitting a reset button, or before
+    switching storage backends.
+    """
+    import json
+    import datetime as _dt
+
+    label = "Badminton" if sport == "bd" else "Pickleball"
+    loader = state.load_bd if sport == "bd" else state.load_pk
+    saver = state.save_bd if sport == "bd" else state.save_pk
+    pending_key = f"_pending_restore_{sport}"
+
+    with st.expander(f"🗄️ {label} Data Backup / Restore", expanded=False, key=f"exp_backup_{sport}"):
+        st.caption(
+            f"Use **Export** to download the current {label} bracket/groups and round schedule as one "
+            "JSON file. Use **Restore** to load that file back in — this replaces the current "
+            f"{label} data with what's in the file (it does not touch the other sport)."
+        )
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            sched = state.load_schedule()
+            backup = {
+                "sport": sport,
+                "exported_at": _dt.datetime.utcnow().isoformat() + "Z",
+                sport: loader(),
+                "schedule": {sport: sched.get(sport, {})},
+            }
+            st.download_button(
+                f"⬇️ Export {label} data",
+                data=json.dumps(backup, indent=2),
+                file_name=f"{label.lower()}_backup_{_dt.date.today().isoformat()}.json",
+                mime="application/json",
+                use_container_width=True,
+                key=f"{sport}_backup_dl",
+            )
+
+        with col2:
+            uploaded = st.file_uploader("Restore from a backup file", type=["json"], key=f"{sport}_restore_upload")
+            if uploaded is not None:
+                st.session_state[pending_key] = json.load(uploaded)
+
+            pending = st.session_state.get(pending_key)
+            if pending:
+                file_sport = pending.get("sport")
+                if file_sport and file_sport != sport:
+                    other = "Badminton" if file_sport == "bd" else "Pickleball"
+                    st.error(f"This file is a {other} backup, not {label}. Upload a {label} backup instead.")
+                elif sport not in pending:
+                    st.error(f"This file doesn't contain {label} data.")
+                else:
+                    st.warning(f"This will OVERWRITE current {label} data with the uploaded file's contents.")
+                    if st.button("⚠️ Confirm restore", type="primary", use_container_width=True,
+                                 key=f"{sport}_confirm_restore"):
+                        actor = auth.actor_name()
+                        saver(pending[sport], actor=actor, action="restore_from_backup")
+                        sched = state.load_schedule()
+                        sched[sport] = pending.get("schedule", {}).get(sport, sched.get(sport, {}))
+                        state.save_schedule(sched, actor=actor)
+                        st.session_state[pending_key] = None
+                        st.success("Restored. Reload the page to see it everywhere.")
+
+
+def _render_routing_repair_panel():
+    """Manual fallback for the losers-bracket routing fix. state.load_bd()
+    now auto-heals stale routing on every load (see its docstring), so this
+    panel should normally report "already up to date" — it's kept as a
+    visible confirmation and as a manual trigger in case load_bd()'s
+    auto-heal hasn't run yet for some reason (e.g. this admin page is
+    opened before any other page loaded the bracket this session).
+    Safe to delete once you're confident every deployment includes the
+    auto-heal in state.py."""
+    bd = state.load_bd()  # auto-heals as a side effect of this call
+    with st.expander("🔧 Losers-bracket routing check", expanded=False, key="exp_routing_check"):
+        st.caption(
+            "The app now auto-repairs stale losers-bracket routing every time the bracket loads, so this "
+            "should always show 'already up to date.' This panel is a manual fallback/confirmation only."
+        )
+        repaired = logic.bd_rebuild_routing(bd)
+        diffs = []
+        for tid, new_tie in repaired["ties"].items():
+            old_tie = bd["ties"].get(tid, {})
+            if (old_tie.get("t1", ""), old_tie.get("t2", "")) != (new_tie["t1"], new_tie["t2"]):
+                diffs.append((tid, old_tie.get("t1", ""), old_tie.get("t2", ""), new_tie["t1"], new_tie["t2"]))
+        if not diffs:
+            st.success("✅ No routing differences found — this bracket already matches the corrected topology.")
+            return
+        st.warning(f"⚠️ {len(diffs)} tie(s) would change:")
+        st.dataframe(
+            [{"Tie": tid, "Before — Team A": b1 or "—", "Before — Team B": b2 or "—",
+              "After — Team A": a1 or "—", "After — Team B": a2 or "—"}
+             for tid, b1, b2, a1, a2 in diffs],
+            hide_index=True, use_container_width=True,
+        )
+        st.caption(
+            "Applying this will re-derive every losers-bracket tie's teams from the fixed routing. "
+            "If any of the affected ties already have scores entered against the WRONG team pairing "
+            "shown above, clear those specific games first (or re-enter them after applying) since the "
+            "score numbers themselves are kept but the teams they're attached to may need re-checking."
+        )
+        if st.button("✅ Apply routing repair", type="primary", key="bd_apply_routing_repair"):
+            state.save_bd(repaired, actor=auth.actor_name(), action="repair_routing")
+            st.success("Routing repaired. Reloading…")
+            st.rerun()
+
+
+def render_badminton_admin():
+    auth.require_admin()
+    _render_badminton_scoring(editable_structure=True)
+
+
+def render_badminton_umpire():
+    auth.require_scorer()
+    _render_badminton_scoring(editable_structure=False)
+
+
+def _render_badminton_scoring(editable_structure: bool):
+    if editable_structure:
+        ui.page_header("Badminton", "Badminton — Admin",
+                        "16 departments · Double elimination · First to 3 category wins · 15 pts (21 from semis)",
+                        "Admin mode", "navy")
+        _render_backup_restore_panel("bd")
+        _render_routing_repair_panel()
+    else:
+        ui.page_header("Badminton", "Badminton — Umpiring",
+                        "Double elimination · First to 3 category wins · 15 pts (21 from semis)",
+                        "Umpire mode", "gold")
+        st.caption("👀 You can enter and adjust scores. Team names and bracket resets are locked to admins.")
+
+    bd = state.load_bd()
+
+    if editable_structure:
+        # Two tiers, same shape as the Pickleball reset panel: a soft reset
+        # that clears scores but keeps the Round 1 pairings you typed in
+        # (so you don't have to re-enter all 16 teams to fix a scoring
+        # mistake), and a full wipe. Badminton doesn't have a separate
+        # "group stage vs. knockout" split like Pickleball does — it's one
+        # continuous bracket — so there's no middle "reset knockout only"
+        # tier here; scores vs. everything covers it.
+        with st.expander("↺ Reset options", expanded=False, key="exp_bd_reset_options"):
+            r1, r2 = st.columns(2)
+            with r1:
+                st.button("Reset all scores", use_container_width=True,
+                          help="Clears every score, category result, and cascaded team assignment "
+                               "back to blank. Keeps the Round 1 team pairings you entered so you "
+                               "don't have to re-type all 16 teams.",
+                          on_click=lambda: st.session_state.update(confirm_bd_reset="scores"))
+            with r2:
+                st.button("Reset everything", use_container_width=True,
+                          help="Clears the entire bracket — Round 1 team pairings, every score, "
+                               "and every result.",
+                          on_click=lambda: st.session_state.update(confirm_bd_reset="all"))
+
+            pending = st.session_state.get("confirm_bd_reset")
+            if pending:
+                labels = {"scores": "**all scores and category results** (Round 1 team pairings stay as-is)",
+                          "all": "**everything** — Round 1 team pairings, every score, and every result"}
+                st.warning(f"This clears {labels[pending]}. This cannot be undone.")
+                c1, c2 = st.columns(2)
+                if c1.button("Yes, reset", key="bd_reset_yes", type="primary", use_container_width=True):
+                    if pending == "scores":
+                        state.reset_bd_scores(actor=auth.actor_name())
+                    else:
+                        state.reset_bd(actor=auth.actor_name())
+                    st.session_state["confirm_bd_reset"] = None
+                    st.rerun()
+                if c2.button("Cancel", key="bd_reset_no", use_container_width=True):
+                    st.session_state["confirm_bd_reset"] = None
+                    st.rerun()
+
+    champ = logic.bd_champion(bd)
+    if champ:
+        st.success(f"🏆 Champion: **{champ}**")
+
+    view = st.radio("View", ["📋 List / Scoring", "🗂 Bracket View"], horizontal=True, label_visibility="collapsed")
+
+    if view == "🗂 Bracket View":
+        st.caption("Reference view — click a card's **Score ▸** button on List / Scoring to enter results.")
+        html = bracket_svg.render_bracket_view_html(bd)
+        components.html(html, height=bracket_svg.canvas_size()["h"] + 40, scrolling=True)
+        return
+
+    if editable_structure:
+        st.caption("💡 Team fields are searchable dropdowns of the LBS/MGB roster — start typing to filter, "
+                   "or type a name that isn't on the list and it'll be used as-is.")
+
+    st.markdown('<div class="lb-cat">Winners Bracket</div>', unsafe_allow_html=True)
+    _render_bd_round_columns(["W1", "W2", "W3", "W4"], bd, editable_structure)
+
+    st.markdown('<div class="lb-cat" style="margin-top:22px">Losers Bracket</div>', unsafe_allow_html=True)
+    _render_bd_round_columns(["L1", "L2", "L3", "L4", "L5", "L6"], bd, editable_structure)
+
+    st.markdown('<div class="lb-cat" style="margin-top:22px">Grand Final</div>', unsafe_allow_html=True)
+    gf_col = st.columns(4)[0]
+    with gf_col:
+        _render_bd_card("GF", bd["ties"]["GF"], 0, editable_structure)
+
+
+def _render_bd_round_columns(round_ids, bd, editable_structure):
+    cols = st.columns(len(round_ids))
+    for col, r in zip(cols, round_ids):
+        with col:
+            info = logic.BD_ROUND_INFO[r]
+            st.markdown(f"**{info['label']}**")
+            st.caption(f"{info['pts']}pt games")
+            tie_ids = sorted([tid for tid in bd["ties"] if tid.split("_")[0] == r],
+                              key=lambda t: int(t.split("_")[1]))
+            for i, tid in enumerate(tie_ids):
+                _render_bd_card(tid, bd["ties"][tid], i, editable_structure)
+
+
+def _render_bd_card(tid, tie, match_no, editable_structure=True):
+    with st.container(border=True):
+        top1, top2 = st.columns([1, 1])
+        top1.caption(f"M{match_no + 1}" if tid != "GF" else "🏆 GF")
+        color = "#1f7a4c" if tie["winner"] else "#12203a"
+        top2.markdown(
+            f"<div style='text-align:right;font-family:monospace;font-weight:800;color:{color}'>"
+            f"{tie['w1']}–{tie['w2']}</div>", unsafe_allow_html=True,
+        )
+        k1, k2 = f"bdc_{tid}_t1", f"bdc_{tid}_t2"
+        ui.dept_combobox("Team A", tie["t1"], k1, _bd_team_change, (tid, "t1", k1), "Dept / Team A",
+                         disabled=not editable_structure)
+        ui.dept_combobox("Team B", tie["t2"], k2, _bd_team_change, (tid, "t2", k2), "Dept / Team B",
+                         disabled=not editable_structure)
+        if tie["winner"]:
+            st.caption("✅ Complete")
+        elif tie["tbNeeded"]:
+            st.caption("⚠️ Tie-breaker")
+        if st.button("Score ▸", key=f"bdc_{tid}_open", use_container_width=True):
+            _bd_score_dialog(tid, editable_structure)
+
+
+@st.dialog("Match scoring", width="large")
+def _bd_score_dialog(tid, editable_structure=True):
+    bd = state.load_bd()
+    tie = bd["ties"][tid]
+    round_id = tid.split("_")[0] if tid != "GF" else "GF"
+    pts = logic.BD_ROUND_INFO[round_id]["pts"]
+    st.caption(logic.BD_ROUND_INFO[round_id]["label"])
+    _render_bd_tie_editor(tid, tie, pts, editable_structure)
+    if st.button("Close", use_container_width=True):
+        st.rerun()
+
+
+def _render_bd_tie_editor(tid, tie, pts, editable_structure=True):
+    c1, c2 = st.columns(2)
+    k1, k2 = f"bd_{tid}_t1", f"bd_{tid}_t2"
+    with c1:
+        ui.dept_combobox("Team A", tie["t1"], k1, _bd_team_change, (tid, "t1", k1), "Dept / Team A",
+                         disabled=not editable_structure)
+    with c2:
+        ui.dept_combobox("Team B", tie["t2"], k2, _bd_team_change, (tid, "t2", k2), "Dept / Team B",
+                         disabled=not editable_structure)
+
+    if tie["winner"]:
+        ui.status_badge(f"Winner: {tie['t1'] if tie['winner'] == 1 else tie['t2']}", "ok")
+    elif tie["tbNeeded"]:
+        ui.status_badge("Tie-breaker needed (2–2)", "warn")
+    st.caption(f"Category wins: {tie['w1']} – {tie['w2']}")
+    st.markdown("")
+
+    for ci, catname in enumerate(logic.BD_CATS):
+        cat = tie["cats"][ci]
+        is_tb = ci == 4
+        tb_locked = is_tb and not (tie["tbNeeded"] or any(g["finished"] for g in cat["games"]))
+        if tb_locked:
+            # Always show the tie-breaker row — even when it isn't needed
+            # yet — so it's visibly present in the dialog from the start,
+            # rather than appearing to materialize out of nowhere only
+            # once a tie happens. Rendered as a locked, greyed-out
+            # placeholder (no score inputs) so there's nothing to
+            # accidentally click or score before it's actually live; it
+            # switches to the normal interactive category below the
+            # moment the other 4 categories split 2–2.
+            st.markdown(
+                f"<div style='opacity:0.45;padding:10px 14px;border:1px dashed #555;"
+                f"border-radius:8px;margin-bottom:8px;font-size:0.9em;'>"
+                f"🔒 {catname} — locked, only activates if the first 4 categories split 2–2</div>",
+                unsafe_allow_html=True,
+            )
+            continue
+        t1_name, t2_name = tie["t1"] or "Team A", tie["t2"] or "Team B"
+        cat_winner = logic.bd_cat_winner(cat)
+
+        def _games(render_fn):
+            for gi in logic.visible_games(cat["games"]):
+                g = cat["games"][gi]
+                key_prefix = f"bd_{tid}_{ci}_{gi}"
+                render_fn(
+                    gi, g, key_prefix,
+                    on_minus=(partial(_bd_point_cb, tid, ci, gi, 1, -1), partial(_bd_point_cb, tid, ci, gi, 2, -1)),
+                    on_plus=(partial(_bd_point_cb, tid, ci, gi, 1, 1), partial(_bd_point_cb, tid, ci, gi, 2, 1)),
+                    on_set=(partial(_bd_score_set_cb, tid, ci, gi, 1), partial(_bd_score_set_cb, tid, ci, gi, 2)),
+                    on_finish=partial(_bd_finish_cb, tid, ci, gi),
+                    on_reopen=partial(_bd_reopen_cb, tid, ci, gi),
+                    pts_target=pts, t1_name=t1_name, t2_name=t2_name,
+                )
+
+        # Every category — decided or still live — gets ONE stable key,
+        # `exp_cat_{tid}_{ci}`, built only from the tie/category id. Both
+        # branches below construct their `summary` text from live data
+        # (the score, who's winning, which game is open) that changes on
+        # every point, so if the key were left to auto-derive from that
+        # summary (the default when no key= is passed), Streamlit would
+        # treat each score update as a brand-new expander and silently
+        # snap it back to expanded=False — which is exactly the "I open
+        # it, add a point, it collapses again" bug. Keying on the id
+        # instead of the label means the SAME widget persists across
+        # reruns, so the umpire's open/closed choice survives.
+        if cat_winner:
+            # Whole category decided (best-of-3 won 2-0 or 2-1) — collapse
+            # it down to one line so a finished tie's 5 categories don't
+            # each spell out 2-3 rows the umpire never needs to touch again.
+            winner_name = t1_name if cat_winner == 1 else t2_name
+            wins1 = sum(1 for g in cat["games"] if g["finished"] and g["p1"] > g["p2"])
+            wins2 = sum(1 for g in cat["games"] if g["finished"] and g["p2"] > g["p1"])
+            summary = f"✅ {catname} — {winner_name} won {wins1}–{wins2}"
+            with st.expander(summary, expanded=False, key=f"exp_cat_{tid}_{ci}"):
+                _games(_render_game_plain)
+        else:
+            # Still live: collapse it the same way a finished category
+            # does, rather than spelling out every category's score rows
+            # at once — with 5 categories (Mixed 1/2, Men's, Women's, and
+            # the tie-break) all expanded by default, an umpire had to
+            # scroll past four categories that aren't theirs to find the
+            # one they're actually scoring today. Collapsed by default
+            # (expanded=False) so it's a deliberate click to open the
+            # right one, not a wall of live score rows to hunt through.
+            # Uses _render_game_plain (never its own expander) rather than
+            # _render_game for the same reason the finished-category
+            # branch above does — Streamlit doesn't support nesting one
+            # expander inside another, so once the category itself is an
+            # expander, individual games inside it can't be too.
+            wins1 = sum(1 for g in cat["games"] if g["finished"] and g["p1"] > g["p2"])
+            wins2 = sum(1 for g in cat["games"] if g["finished"] and g["p2"] > g["p1"])
+            open_gi = next((gi for gi in logic.visible_games(cat["games"]) if not cat["games"][gi]["finished"]), None)
+            if open_gi is not None:
+                g = cat["games"][open_gi]
+                status = f"Game {open_gi + 1} · {g['p1']}–{g['p2']}" if (g["p1"] or g["p2"]) else f"Game {open_gi + 1} · not started"
+            else:
+                status = "in progress"
+            summary = f"▶ {catname} — {status} ({wins1}–{wins2})"
+            with st.expander(summary, expanded=False, key=f"exp_cat_{tid}_{ci}"):
+                _games(_render_game_plain)
+
+    if editable_structure:
+        st.button("↺ Reset this tie", key=f"bd_{tid}_reset", on_click=partial(_bd_reset_tie_cb, tid))
+
+
+# ───────────────────────── pickleball callbacks ─────────────────────────
+
+def _pk_pair_name_change(grp, idx, key):
+    pk = state.load_pk()
+    logic.pk_set_pair_name(pk, grp, idx, st.session_state[key])
+    state.save_pk(pk, actor=auth.actor_name(), action=f"set_pair:{grp}:{idx}")
+
+
+def _pk_add_pair_cb(grp):
+    pk = state.load_pk()
+    logic.pk_add_pair(pk, grp)
+    state.save_pk(pk, actor=auth.actor_name(), action=f"add_pair:{grp}")
+
+
+def _pk_remove_pair_cb(grp):
+    pk = state.load_pk()
+    logic.pk_remove_pair(pk, grp)
+    state.save_pk(pk, actor=auth.actor_name(), action=f"remove_pair:{grp}")
+
+
+def _pk_point_cb(grp, i, j, gi, who, delta):
+    pk = state.load_pk()
+    logic.pk_point(pk, grp, i, j, gi, who, delta)
+    state.save_pk(pk, actor=auth.actor_name(), action=f"point:{grp}")
+
+
+def _pk_score_set_cb(grp, i, j, gi, who, key):
+    pk = state.load_pk()
+    logic.pk_set_point(pk, grp, i, j, gi, who, st.session_state[key])
+    state.save_pk(pk, actor=auth.actor_name(), action=f"set_score:{grp}")
+
+
+def _pk_finish_cb(grp, i, j, gi):
+    pk = state.load_pk()
+    logic.pk_finish_game(pk, grp, i, j, gi)
+    state.save_pk(pk, actor=auth.actor_name(), action=f"finish:{grp}")
+
+
+def _pk_reopen_cb(grp, i, j, gi):
+    pk = state.load_pk()
+    logic.pk_reopen_game(pk, grp, i, j, gi)
+    state.save_pk(pk, actor=auth.actor_name(), action=f"reopen:{grp}")
+
+
+def _pk_auto_seed_cb():
+    pk = state.load_pk()
+    logic.pk_auto_seed_ko(pk)
+    state.save_pk(pk, actor=auth.actor_name(), action="auto_seed_ko")
+
+
+def _pk_ko_team_change(tid, which, key):
+    pk = state.load_pk()
+    logic.pk_ko_set_team(pk, tid, which, st.session_state[key])
+    state.save_pk(pk, actor=auth.actor_name(), action=f"ko_set_team:{tid}")
+
+
+def _pk_ko_point_cb(tid, gi, who, delta):
+    pk = state.load_pk()
+    logic.pk_ko_point(pk, tid, gi, who, delta)
+    state.save_pk(pk, actor=auth.actor_name(), action=f"ko_point:{tid}")
+
+
+def _pk_ko_score_set_cb(tid, gi, who, key):
+    pk = state.load_pk()
+    logic.pk_ko_set_point(pk, tid, gi, who, st.session_state[key])
+    state.save_pk(pk, actor=auth.actor_name(), action=f"ko_set_score:{tid}")
+
+
+def _pk_ko_finish_cb(tid, gi):
+    pk = state.load_pk()
+    logic.pk_ko_finish_game(pk, tid, gi)
+    state.save_pk(pk, actor=auth.actor_name(), action=f"ko_finish:{tid}")
+
+
+def _pk_ko_reopen_cb(tid, gi):
+    pk = state.load_pk()
+    logic.pk_ko_reopen_game(pk, tid, gi)
+    state.save_pk(pk, actor=auth.actor_name(), action=f"ko_reopen:{tid}")
+
+
+def _pk_ko_reset_tie_cb(tid):
+    pk = state.load_pk()
+    logic.pk_ko_reset_tie(pk, tid)
+    state.save_pk(pk, actor=auth.actor_name(), action=f"ko_reset:{tid}")
+
+
+def render_pickleball_admin():
+    auth.require_admin()
+    _render_pickleball_scoring(editable_structure=True)
+
+
+def render_pickleball_umpire():
+    auth.require_scorer()
+    _render_pickleball_scoring(editable_structure=False)
+
+
+def _render_pickleball_scoring(editable_structure: bool):
+    if editable_structure:
+        ui.page_header("Pickleball", "Pickleball — Admin",
+                        "22 pairs · 4 groups · Top 4 per group advance · Mixed doubles · "
+                        "Best of 3 to 15 pts (Best of 5 from Semis)",
+                        "Admin mode", "navy")
+        _render_backup_restore_panel("pk")
+    else:
+        ui.page_header("Pickleball", "Pickleball — Umpiring",
+                        "4 groups · Top 4 per group advance · Mixed doubles · "
+                        "Best of 3 to 15 pts (Best of 5 from Semis)",
+                        "Umpire mode", "gold")
+        st.caption("👀 You can enter and adjust scores. Pair names, group setup, and resets are locked to admins.")
+
+    if editable_structure:
+        with st.expander("↺ Reset options", expanded=False, key="exp_pk_reset_options"):
+            r1, r2, r3 = st.columns(3)
+            with r1:
+                st.button("Reset group scores", use_container_width=True,
+                          help="Clears every group-stage match back to 0-0. Keeps pairs/groups and "
+                               "the knockout bracket untouched.",
+                          on_click=lambda: st.session_state.update(confirm_pk_reset="scores"))
+            with r2:
+                st.button("Reset knockout bracket", use_container_width=True,
+                          help="Clears the knockout bracket back to blank (ready for auto-seeding). "
+                               "Keeps pairs/groups and group scores untouched.",
+                          on_click=lambda: st.session_state.update(confirm_pk_reset="ko"))
+            with r3:
+                st.button("Reset everything", use_container_width=True,
+                          help="Clears pairs, groups, scores, AND the knockout bracket — a full wipe.",
+                          on_click=lambda: st.session_state.update(confirm_pk_reset="all"))
+
+            pending = st.session_state.get("confirm_pk_reset")
+            if pending:
+                labels = {"scores": "**all group-stage scores** (pairs/groups and the KO bracket stay as-is)",
+                          "ko": "**the knockout bracket** (pairs/groups and group scores stay as-is)",
+                          "all": "**everything** — pairs, groups, scores, and the KO bracket"}
+                st.warning(f"This clears {labels[pending]}. This cannot be undone.")
+                c1, c2 = st.columns(2)
+                if c1.button("Yes, reset", key="pk_reset_yes", type="primary", use_container_width=True):
+                    if pending == "scores":
+                        state.reset_pk_scores(actor=auth.actor_name())
+                    elif pending == "ko":
+                        state.reset_pk_knockout(actor=auth.actor_name())
+                    else:
+                        state.reset_pk(actor=auth.actor_name())
+                    st.session_state["confirm_pk_reset"] = None
+                    st.rerun()
+                if c2.button("Cancel", key="pk_reset_no", use_container_width=True):
+                    st.session_state["confirm_pk_reset"] = None
+                    st.rerun()
+
+    pk = state.load_pk()
+    champ = logic.pk_champion(pk)
+    if champ:
+        st.success(f"🏆 Champion: **{champ}**")
+
+    # Umpires don't need (or get) the Pairs & Groups setup tab — they only
+    # ever touch scores, so their tab bar skips straight to matches.
+    if editable_structure:
+        tab1, tab2, tab3 = st.tabs(["👥 Pairs & Groups", "🔁 Group Matches", "🏆 Knockout Bracket"])
+    else:
+        tab1 = None
+        tab2, tab3 = st.tabs(["🔁 Group Matches", "🏆 Knockout Bracket"])
+
+    if tab1 is not None:
+        with tab1:
+            cols = st.columns(2)
+            for i, grp in enumerate(["A", "B", "C", "D"]):
+                with cols[i % 2]:
+                    st.subheader(f"Group {grp}")
+                    pairs = pk["groups"][grp]
+                    for idx, p in enumerate(pairs):
+                        key = f"pk_{grp}_{idx}_name"
+                        st.text_input(f"Pair {idx + 1}", value=p["name"], key=key,
+                                      on_change=_pk_pair_name_change, args=(grp, idx, key))
+                    bc1, bc2 = st.columns(2)
+                    bc1.button(f"− Remove pair (Group {grp})", key=f"pk_{grp}_remove",
+                               on_click=partial(_pk_remove_pair_cb, grp), use_container_width=True,
+                               disabled=len(pairs) <= 4)
+                    bc2.button(f"+ Add pair (Group {grp})", key=f"pk_{grp}_add",
+                               on_click=partial(_pk_add_pair_cb, grp), use_container_width=True,
+                               disabled=len(pairs) >= 10)
+                    st.markdown("---")
+
+    with tab2:
+        grp = st.selectbox("Group", ["A", "B", "C", "D"], key="pk_matches_group")
+        pairs = pk["groups"][grp]
+        n = len(pairs)
+        st.markdown("**Standings**")
+        standings = logic.pk_standings(pk, grp)
+        st.dataframe(
+            [{"#": r + 1, "Pair": s["name"] or f"Pair {s['idx']+1}", "W-L": f"{s['mw']}-{s['ml']}",
+              "Diff": f"{'+' if s['diff']>0 else ''}{s['diff']}", "Advances": "✅" if r < 4 else ""}
+             for r, s in enumerate(standings)],
+            hide_index=True, use_container_width=True,
+        )
+        st.markdown("**Matches**")
+        for i in range(n):
+            for j in range(i + 1, n):
+                t1 = pairs[i]["name"] or f"Pair {i+1}"
+                t2 = pairs[j]["name"] or f"Pair {j+1}"
+                m = logic.pk_get_match(pk, grp, i, j)
+                badge = " ✅" if m["winner"] else ""
+                with st.expander(f"{t1}  vs  {t2}{badge}", key=f"exp_pk_{grp}_{i}_{j}"):
+                    for gi in logic.visible_games(m["games"]):
+                        g = m["games"][gi]
+                        key_prefix = f"pk_{grp}_{i}_{j}_{gi}"
+                        _render_game(
+                            gi, g, key_prefix,
+                            on_minus=(partial(_pk_point_cb, grp, i, j, gi, 1, -1), partial(_pk_point_cb, grp, i, j, gi, 2, -1)),
+                            on_plus=(partial(_pk_point_cb, grp, i, j, gi, 1, 1), partial(_pk_point_cb, grp, i, j, gi, 2, 1)),
+                            on_set=(partial(_pk_score_set_cb, grp, i, j, gi, 1), partial(_pk_score_set_cb, grp, i, j, gi, 2)),
+                            on_finish=partial(_pk_finish_cb, grp, i, j, gi),
+                            on_reopen=partial(_pk_reopen_cb, grp, i, j, gi),
+                            pts_target=PK_PTS,
+                            t1_name=t1, t2_name=t2,
+                        )
+        # persist any match dicts created on-the-fly by pk_get_match
+        state.save_pk(pk, actor=auth.actor_name(), action="touch_matches")
+
+    with tab3:
+        if editable_structure:
+            st.button("⚡ Auto-seed Round of 16 from current group standings", on_click=_pk_auto_seed_cb)
+            st.caption("Cross-seeds so an A/D-side qualifier always meets a B/C-side qualifier in the quarter-finals.")
+            st.markdown("---")
+        for r in ["K1", "K2", "K3", "GF"]:
+            ids = sorted([tid for tid in pk["ko"] if (tid.startswith(r + "_") or (r == "GF" and tid == "GF"))])
+            if not ids:
+                continue
+            st.subheader(logic.PK_ROUND_LABELS[r])
+            if r in logic.PK_BO5_ROUNDS:
+                st.caption("🔥 Best of 5 — first pair to win 3 games takes the tie.")
+            else:
+                st.caption("Best of 3 — first pair to win 2 games takes the tie.")
+            for tid in ids:
+                tie = pk["ko"][tid]
+                badge = " ✅" if tie["winner"] else ""
+                with st.expander(f"{tie['t1'] or 'TBD'}  vs  {tie['t2'] or 'TBD'}{badge}", key=f"exp_pkko_{tid}"):
+                    k1, k2 = f"pkko_{tid}_t1", f"pkko_{tid}_t2"
+                    c1, c2 = st.columns(2)
+                    c1.text_input("Pair A", value=tie["t1"], key=k1, on_change=_pk_ko_team_change, args=(tid, "t1", k1),
+                                  disabled=not editable_structure)
+                    c2.text_input("Pair B", value=tie["t2"], key=k2, on_change=_pk_ko_team_change, args=(tid, "t2", k2),
+                                  disabled=not editable_structure)
+                    for gi in logic.visible_games(tie["games"]):
+                        g = tie["games"][gi]
+                        key_prefix = f"pkko_{tid}_{gi}"
+                        _render_game(
+                            gi, g, key_prefix,
+                            on_minus=(partial(_pk_ko_point_cb, tid, gi, 1, -1), partial(_pk_ko_point_cb, tid, gi, 2, -1)),
+                            on_plus=(partial(_pk_ko_point_cb, tid, gi, 1, 1), partial(_pk_ko_point_cb, tid, gi, 2, 1)),
+                            on_set=(partial(_pk_ko_score_set_cb, tid, gi, 1), partial(_pk_ko_score_set_cb, tid, gi, 2)),
+                            on_finish=partial(_pk_ko_finish_cb, tid, gi),
+                            on_reopen=partial(_pk_ko_reopen_cb, tid, gi),
+                            pts_target=PK_PTS,
+                            t1_name=tie["t1"] or "Pair A", t2_name=tie["t2"] or "Pair B",
+                        )
+                    if editable_structure:
+                        st.button("↺ Reset this match", key=f"pkko_{tid}_reset", on_click=partial(_pk_ko_reset_tie_cb, tid))
+
+
+# ───────────────────────── settings / schedule ─────────────────────────
+
+def render_settings():
+    auth.require_admin()
+    ui.page_header("Settings", "Schedule & Settings",
+                    "Round dates, password setup, and the recent-activity audit log", "Admin mode", "navy")
+
+    sched = state.load_schedule()
+
+    st.subheader("Round schedule")
+    st.caption("Tag each round with a date. Viewers can filter monitors down to \"today's rounds\" on event day.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Badminton rounds**")
+        for r in logic.ALL_BD_ROUNDS:
+            val = sched["bd"].get(r, "")
+            new_val = st.text_input(logic.BD_ROUND_INFO[r]["label"], value=val, key=f"sched_bd_{r}",
+                                     placeholder="YYYY-MM-DD")
+            sched["bd"][r] = new_val
+    with c2:
+        st.markdown("**Pickleball rounds**")
+        for r in logic.ALL_PK_ROUNDS:
+            val = sched["pk"].get(r, "")
+            new_val = st.text_input(logic.PK_ROUND_LABELS[r], value=val, key=f"sched_pk_{r}",
+                                     placeholder="YYYY-MM-DD")
+            sched["pk"][r] = new_val
+
+    if st.button("💾 Save schedule", type="primary"):
+        state.save_schedule(sched, actor=auth.actor_name())
+        st.success("Schedule saved.")
+
+    st.markdown("---")
+    st.subheader("Admin password")
+    st.info(
+        "The shared admin password is set outside the app for security — via `st.secrets['admin_password']` "
+        "(recommended for Streamlit Community Cloud, in `.streamlit/secrets.toml`) or the `TOURNEY_ADMIN_PASSWORD` "
+        "environment variable. See the README for setup steps."
+    )
+
+    st.markdown("---")
+    st.subheader("Recent activity")
+    log = db.get_audit_log(limit=30)
+    if log:
+        st.dataframe(log, hide_index=True, use_container_width=True)
+    else:
+        st.caption("No activity yet.")
